@@ -52,7 +52,14 @@ build/camhal_backend.o: src/camhal_backend.cpp src/camhal_backend.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-.PHONY: clean install install-monitor
+# Standalone HAL open/release cycle test (verify destroy releases the camera so
+# a second open/open cycle succeeds, isolated from WirePlumber auto-linking).
+build/test-hal-release: test/test-hal-release.cpp build/camhal_backend.o
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -std=c++11 -o $@ test/test-hal-release.cpp build/camhal_backend.o -lcamhal -lpthread
+
+.PHONY: clean install install-monitor test-hal-release
+test-hal-release: build/test-hal-release
 clean:
 	rm -rf build
 

@@ -147,6 +147,56 @@ int camhal_backend_dqbuf(struct camhal_backend *b,
 			 uint64_t *out_ts);
 
 /*
+ * Direct / zero-copy mode (R-A): register caller-owned mmap'd buffers as the
+ * HAL's USERPTR buffers instead of allocating our own.  This lets the HAL write
+ * frames straight into buffers that are ALSO the SPA output buffers, so the
+ * capture thread needs no memcpy when the HAL does not pad lines.
+ *
+ * This is ONLY valid when the HAL's bytes-per-line equals the nominal width
+ * (no per-line padding).  If the HAL would pad (stride > width) the layout is
+ * incompatible with a packed NV12 output and this returns -EINVAL so the caller
+ * can fall back to the copying path (camhal_backend_configure + dqbuf + tmpbuf).
+ *
+ *   addrs     - array of n_buffers pointers, each a writable mmap'd region of
+ *               at least addr_size bytes (e.g. the SPA output buffer d->data)
+ *   addr_size - size each caller buffer can hold (HAL writes up to this)
+ *   out_stride/out_size - as in camhal_backend_configure (HAL stride/size)
+ *
+ * After a successful configure_external the caller drives capture with
+ * camhal_backend_dqbuf_index() and must hand each dequeued buffer back with
+ * camhal_backend_release() once the consumer is done with it (in the SPA plugin
+ * that is when the consumer calls reuse_buffer).  Buffers are NOT auto-requeued.
+ *
+ * Returns 0 on success, -EINVAL when the layout would need padding / when the
+ * memory type cannot be used, or a negative errno.
+ */
+int camhal_backend_configure_external(struct camhal_backend *b,
+				      int width, int height,
+				      int n_buffers,
+				      void **addrs, size_t addr_size,
+				      int *out_stride, int *out_size);
+
+/*
+ * Zero-copy capture: dequeues one frame (a buffer from
+ * camhal_backend_configure_external), does NOT copy and does NOT requeue it.
+ *   out_index - receives the index (0..n_buffers-1) of the dequeued buffer, so
+ *               the caller can map it back to its own buffer slot
+ *   out_ts    - receives the buffer timestamp (ns) if non-NULL
+ * The caller MUST eventually call camhal_backend_release(index) to hand the
+ * buffer back to the HAL.
+ * Returns 0 on success, negative errno on failure.
+ */
+int camhal_backend_dqbuf_index(struct camhal_backend *b,
+			       int *out_index, uint64_t *out_ts);
+
+/*
+ * Hand a dequeued direct-mode buffer back to the HAL.  Call exactly once per
+ * buffer returned by camhal_backend_dqbuf_index(), when the consumer is done
+ * with it (in the SPA plugin: reuse_buffer).  Returns 0 on success.
+ */
+int camhal_backend_release(struct camhal_backend *b, int index);
+
+/*
  * Stop (camera_device_stop) and release resources (close + deinit).
  */
 int camhal_backend_stop(struct camhal_backend *b);

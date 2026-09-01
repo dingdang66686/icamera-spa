@@ -175,6 +175,18 @@ void camhal_free_cameras(struct camhal_camera_info *cams, int count)
 	struct camhal_camera_info *cams;    /* (owned/simple) */
 	camera_buffer_t **buffers;           /* the qbuf/dqbuf buffer array */
 
+	/* R-A direct / zero-copy mode: when the HAL does not pad lines we let the
+	 * caller's mmap'd buffers (which are ALSO the SPA output buffers) serve
+	 * directly as the HAL's USERPTR buffers, eliminating the memcpy.  In this
+	 * mode buffers[] hold camera_buffer_t wrappers whose ->addr point into the
+	 * caller's regions, index i maps 1:1 to buffers[i], and requeue is driven
+	 * by camhal_backend_release() (the SPA consumer's reuse_buffer) instead of
+	 * the automatic inflight window. */
+	int      external;            /* 1 = direct mode (caller-owned buffers) */
+	void   **external_addrs;      /* caller-provided region pointers (owned by caller) */
+	int     *external_out;        /* per-slot: 1 = currently dequeued, not yet released */
+	int      external_head;       /* oldest not-yet-released, for in-order release */
+
 	/*
 	 * Multi-buffer in-flight pipeline (P0 fix, mirrors icamerasrc).
 	 *
@@ -344,6 +356,7 @@ struct camhal_backend *camhal_backend_create(int camera_id,
 		delete b;
 		return NULL;
 	}
+	CAM_LOG_INFO(b, "camhal: OPEN camera %d (camera_device_open ok)", camera_id);
 
 	/*
 	 * Mirror icamerasrc: it calls camera_set_parameters() IMMEDIATELY after
@@ -369,6 +382,150 @@ struct camhal_backend *camhal_backend_create(int camera_id,
 	}
 
 	return b;
+}
+
+/*
+ * Create the USERPTR camera_buffer_t array backing a stream.  In copy mode
+ * (external_addrs == NULL) we posix_memalign our own buffers of buf_size bytes;
+ * in direct / zero-copy mode (external) we wrap caller-owned mmap'd regions so
+ * the HAL writes straight into (what are also) the SPA output buffers.
+ *
+ * On entry the stream (config_streams) has already been applied and
+ * b->stream_stride / b->stream_size are set.  Queues every buffer to the HAL
+ * (num_buffers=1 per buffer, the correct single-stream usage).
+ *
+ * Returns 0 on success, negative errno otherwise (partially built buffers are
+ * freed).
+ */
+static int setup_userptr_buffers(struct camhal_backend *b,
+				 const stream_t &stream, int n_buffers,
+				 void **external_addrs, size_t addr_size,
+				 int buf_size)
+{
+	size_t bufsz;
+	int i;
+
+	/* Determine the per-buffer allocation size.  For external (direct) mode
+	 * the caller's regions are used as-is; for copy mode we size to the HAL
+	 * frame size page-aligned. */
+	if (external_addrs) {
+		/* The HAL reports stream.size with conservative allocation slack
+		 * even when stride==width (e.g. 461824 for 640x480 whose packed
+		 * NV12 is 460800).  What the HAL actually writes is
+		 * stride*height*3/2 bytes (stride==width in direct mode = packed
+		 * data_size).  Validate the caller's region against that real
+		 * written size, NOT the slack-inflated stream.size, so a packed
+		 * SPA output buffer (data_size bytes) is accepted. */
+		size_t need = (size_t)b->stream_stride * b->stream_height * 3 / 2;
+		if (addr_size < need) {
+			CAM_LOG_ERR(b, "camhal: external buffer size %zu < need %zu "
+				    "(stride=%d h=%d)", addr_size, need,
+				    b->stream_stride, b->stream_height);
+			return -EINVAL;
+		}
+		bufsz = addr_size;
+		b->external = 1;
+		b->external_addrs = external_addrs;
+		b->external_out = (int *)calloc(n_buffers, sizeof(int));
+		b->external_head = 0;
+		if (!b->external_out) {
+			b->external = 0;
+			return -ENOMEM;
+		}
+	} else {
+		bufsz = (size_t)buf_size;
+		/* align up to a page boundary */
+		if (bufsz & (getpagesize() - 1))
+			bufsz = (bufsz + getpagesize() - 1) &
+				~((size_t)getpagesize() - 1);
+	}
+
+	b->buffers = (camera_buffer_t **)calloc(n_buffers,
+						sizeof(camera_buffer_t *));
+	if (!b->buffers) {
+		if (b->external_out) {
+			free(b->external_out);
+			b->external_out = NULL;
+		}
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < n_buffers; i++) {
+		camera_buffer_t *buf =
+			(camera_buffer_t *)calloc(1, sizeof(camera_buffer_t));
+		if (!buf)
+			goto err;
+		buf->s = stream;
+		buf->s.memType = V4L2_MEMORY_USERPTR;
+		buf->s.size = (uint32_t)bufsz;
+		buf->index = i;
+
+		if (external_addrs) {
+			buf->addr = external_addrs[i];
+		} else if (posix_memalign(&buf->addr, getpagesize(), bufsz) != 0) {
+			CAM_LOG_ERR(b, "camhal: posix_memalign %d failed", i);
+			free(buf);
+			goto err;
+		}
+		b->buffers[i] = buf;
+		CAM_LOG_DEBUG(b, "camhal: userptr buffer %d addr=%p size=%zu%s",
+			      i, buf->addr, bufsz,
+			      external_addrs ? " (external/direct)" : "");
+	}
+
+	/*
+	 * Queue the initial buffers one at a time.
+	 *
+	 * IMPORTANT: camera_stream_qbuf()'s num_buffers argument is the number
+	 * of DIFFERENT streams in the array, NOT the number of buffers.  With a
+	 * single stream the HAL maps each queued buffer to that stream, so we
+	 * MUST call qbuf with num_buffers=1 once per buffer.  Passing n_buffers
+	 * (e.g. 16) told the HAL there were 16 streams, corrupting the mapping
+	 * and leaving the stream stuck on the first frame.
+	 */
+	for (i = 0; i < n_buffers; i++) {
+		camera_buffer_t *one = b->buffers[i];
+		/* Match icamerasrc: reset sequence/timestamp before every qbuf so
+		 * the HAL treats the request as a NEW request (normal 3A) instead
+		 * of activating the raw-reprocess branch
+		 * (RequestThread::handleRequest checks sequence>=0 && timestamp>0
+		 * -> skip 3A, effectSeq goes stale, PSysProcessor::needExecutePipe
+		 * returns false -> output buffer never popped -> dqbuf hands back
+		 * the same stale buffer = freeze). */
+		one->sequence = -1;
+		one->timestamp = 0;
+		if (camera_stream_qbuf(b->camera_id, &one, 1, NULL) < 0) {
+			/* Not an OOM: free local wrappers but never the caller's
+			 * external regions. */
+			for (int j = 0; j < n_buffers; j++) {
+				if (!b->buffers[j])
+					continue;
+				if (!external_addrs && b->buffers[j]->addr)
+					free(b->buffers[j]->addr);
+				free(b->buffers[j]);
+			}
+			free(b->buffers);
+			b->buffers = NULL;
+			return -EIO;
+		}
+	}
+	return 0;
+
+err:
+	for (int j = 0; j < i; j++) {
+		if (b->buffers[j]) {
+			if (!external_addrs && b->buffers[j]->addr)
+				free(b->buffers[j]->addr);
+			free(b->buffers[j]);
+		}
+	}
+	free(b->buffers);
+	b->buffers = NULL;
+	if (b->external_out) {
+		free(b->external_out);
+		b->external_out = NULL;
+	}
+	return -ENOMEM;
 }
 
 int camhal_backend_configure(struct camhal_backend *b,
@@ -474,75 +631,12 @@ int camhal_backend_configure(struct camhal_backend *b,
 	 * SGRBG10 into NV12) MMAP allocation fails, so we use USERPTR exactly
 	 * like icamerasrc does.
 	 */
-	b->buffers = (camera_buffer_t **)calloc(n_buffers, sizeof(camera_buffer_t *));
-	if (!b->buffers)
-		return -ENOMEM;
-
-	size_t bufsz = (size_t)b->stream_size;
-	/* align up to a page boundary */
-	if (bufsz & (getpagesize() - 1))
-		bufsz = (bufsz + getpagesize() - 1) & ~((size_t)getpagesize() - 1);
-
-	for (int i = 0; i < n_buffers; i++) {
-		camera_buffer_t *buf = (camera_buffer_t *)calloc(1, sizeof(camera_buffer_t));
-		if (!buf) {
-			for (int j = 0; j < i; j++) {
-				if (b->buffers[j]) {
-					if (b->buffers[j]->addr)
-						free(b->buffers[j]->addr);
-					free(b->buffers[j]);
-				}
-			}
-			free(b->buffers);
-			b->buffers = NULL;
-			return -ENOMEM;
-		}
-		buf->s = stream;
-		buf->s.memType = V4L2_MEMORY_USERPTR;
-		buf->s.size = (uint32_t)bufsz;
-		buf->index = i;
-
-		if (posix_memalign(&buf->addr, getpagesize(), bufsz) != 0) {
-			CAM_LOG_ERR(b, "camhal: posix_memalign %d failed", i);
-			free(buf);
-			for (int j = 0; j < i; j++) {
-				if (b->buffers[j]) {
-					if (b->buffers[j]->addr)
-						free(b->buffers[j]->addr);
-					free(b->buffers[j]);
-				}
-			}
-			free(b->buffers);
-			b->buffers = NULL;
-			return -ENOMEM;
-		}
-		b->buffers[i] = buf;
-		CAM_LOG_DEBUG(b, "camhal: userptr buffer %d addr=%p size=%zu",
-			      i, buf->addr, bufsz);
-	}
-
-	/*
-	 * Queue the initial buffers one at a time.
-	 *
-	 * IMPORTANT: camera_stream_qbuf()'s num_buffers argument is the number
-	 * of DIFFERENT streams in the array, NOT the number of buffers.  With a
-	 * single stream the HAL maps each queued buffer to that stream, so we
-	 * MUST call qbuf with num_buffers=1 once per buffer.  Passing n_buffers
-	 * (e.g. 16) told the HAL there were 16 streams, corrupting the mapping
-	 * and leaving the stream stuck on the first frame.
-	 */
-	for (int i = 0; i < n_buffers; i++) {
-		camera_buffer_t *one = b->buffers[i];
-		/* Match icamerasrc: reset sequence/timestamp before every qbuf so
-		 * the HAL treats the request as a NEW request (normal 3A) instead
-		 * of activating the raw-reprocess branch (RequestThread::handleRequest
-		 * checks sequence>=0 && timestamp>0 -> skip 3A, effectSeq goes stale,
-		 * PSysProcessor::needExecutePipe returns false -> output buffer never
-		 * popped -> dqbuf hands back the same stale buffer = freeze). */
-		one->sequence = -1;
-		one->timestamp = 0;
-		if (camera_stream_qbuf(b->camera_id, &one, 1, NULL) < 0)
-			return -EIO;
+	{
+		int ret = setup_userptr_buffers(b, stream, n_buffers,
+					       NULL, 0, /* external */
+					       b->stream_size);
+		if (ret != 0)
+			return ret;
 	}
 
 	if (out_stride)
@@ -590,6 +684,10 @@ int camhal_backend_dqbuf(struct camhal_backend *b,
 {
 	if (!b || !b->running)
 		return -EACCES;
+	/* Copying capture is only for copy mode; direct mode uses
+	 * camhal_backend_dqbuf_index(). */
+	if (b->external)
+		return -EINVAL;
 
 	camera_buffer_t *buf = NULL;
 
@@ -687,26 +785,220 @@ int camhal_backend_dqbuf(struct camhal_backend *b,
 	return 0;
 }
 
+int camhal_backend_configure_external(struct camhal_backend *b,
+				      int width, int height,
+				      int n_buffers,
+				      void **addrs, size_t addr_size,
+				      int *out_stride, int *out_size)
+{
+	int ret;
+
+	if (!b || !addrs || n_buffers <= 0)
+		return -EINVAL;
+
+	/* Find the full, HAL-known stream description for (NV12, width x height),
+	 * mirroring camhal_backend_configure.  We need the real table entry so
+	 * stride/size come back correct for the zero-copy check. */
+	camera_info_t cinfo;
+	memset(&cinfo, 0, sizeof(cinfo));
+	stream_array_t configs;
+	stream_t stream;
+	memset(&stream, 0, sizeof(stream));
+	int found = 0;
+
+	if (get_camera_info(b->camera_id, cinfo) == 0 && cinfo.capability) {
+		configs.clear();
+		cinfo.capability->getSupportedStreamConfig(configs);
+		for (size_t i = 0; i < configs.size(); i++) {
+			if (configs[i].format == V4L2_PIX_FMT_NV12 &&
+			    configs[i].width == (uint32_t)width &&
+			    configs[i].height == (uint32_t)height) {
+				stream = configs[i];
+				found = 1;
+				break;
+			}
+		}
+	}
+	if (!found) {
+		CAM_LOG_WARN(b, "camhal: external: no supported NV12 %dx%d stream",
+			     width, height);
+		return -EINVAL;
+	}
+	stream.memType = V4L2_MEMORY_USERPTR;
+
+	/*
+	 * Direct / zero-copy is ONLY safe when the HAL does not pad each line,
+	 * i.e. its bytes-per-line equals the nominal width.  If the HAL would pad
+	 * (stride > width) the SPA/consumer layout (packed NV12:
+	 * width*height*3/2) does not match the HAL's padded layout and we cannot
+	 * hand the consumer's buffers straight to the HAL, so refuse and let the
+	 * caller fall back to the copying path.
+	 */
+	int stride = stream.stride > 0 ? stream.stride : width;
+	if (stride != width) {
+		CAM_LOG_INFO(b, "camhal: direct mode declined: stride=%d != width=%d "
+			     "(would need padding) - falling back to copy path",
+			     stride, width);
+		return -EINVAL;
+	}
+
+	/* Apply the stream configuration exactly like the copying configure. */
+	stream_config_t config;
+	memset(&config, 0, sizeof(config));
+	config.operation_mode = CAMERA_STREAM_CONFIGURATION_MODE_AUTO;
+	config.num_streams = 1;
+	config.streams = &stream;
+
+	stream_t input_config;
+	memset(&input_config, 0, sizeof(input_config));
+	input_config.format = -1;
+	input_config.width  = 0;
+	input_config.height = 0;
+	camera_device_config_sensor_input(b->camera_id, &input_config);
+
+	if (camera_device_config_streams(b->camera_id, &config) < 0)
+		return -EIO;
+
+	CAM_LOG_INFO(b, "camhal: external config_streams OK id=%d format=0x%x "
+		     "%dx%d stride=%d size=%d", stream.id, stream.format,
+		     stream.width, stream.height, stream.stride, stream.size);
+
+	b->stream_id = stream.id;
+	b->stream_width = width;
+	b->stream_height = height;
+	b->stream_size = stream.size > 0 ? (int)stream.size
+					: (int)((size_t)width * height * 3 / 2);
+	b->stream_stride = stride;
+	b->n_buffers = n_buffers;
+
+	CAM_LOG_INFO(b, "camhal: direct mode: HAL stride==width (%d), "
+		     "zero-copy via caller USERPTR buffers", stride);
+
+	/* Register the caller's mmap'd buffers as the USERPTR array. */
+	ret = setup_userptr_buffers(b, stream, n_buffers,
+				    addrs, addr_size, 0);
+	if (ret != 0)
+		return ret;
+
+	if (out_stride)
+		*out_stride = b->stream_stride;
+	if (out_size)
+		*out_size = b->stream_size;
+	return 0;
+}
+
+int camhal_backend_dqbuf_index(struct camhal_backend *b,
+			       int *out_index, uint64_t *out_ts)
+{
+	camera_buffer_t *buf = NULL;
+
+	if (!b || !b->running || !b->external || !out_index)
+		return -EINVAL;
+
+	/* Block until a frame lands in one of the direct-mode USERPTR buffers. */
+	if (camera_stream_dqbuf(b->camera_id, b->stream_id, &buf, NULL) < 0)
+		return -EIO;
+
+	if (buf->index < 0 || buf->index >= b->n_buffers) {
+		CAM_LOG_ERR(b, "camhal: dqbuf_index returned bad index %d (n=%d)",
+			    buf->index, b->n_buffers);
+		/* Try to hand it back so we don't leak it. */
+		buf->sequence = -1;
+		buf->timestamp = 0;
+		camera_stream_qbuf(b->camera_id, &buf, 1, NULL);
+		return -EIO;
+	}
+
+	{
+		static long nd = 0;
+		if ((++nd % 200) == 1)
+			CAM_LOG_DEBUG(b, "camhal: DQB-idx=%d seq=%ld frame=%u ts=%lu",
+				      buf->index, (long)buf->sequence,
+				      buf->frameNumber,
+				      (unsigned long)buf->timestamp);
+	}
+
+	pthread_mutex_lock(&b->lock);
+	b->external_out[buf->index] = 1;
+	pthread_mutex_unlock(&b->lock);
+
+	if (out_ts)
+		*out_ts = buf->timestamp;
+	*out_index = buf->index;
+	return 0;
+}
+
+int camhal_backend_release(struct camhal_backend *b, int index)
+{
+	camera_buffer_t *buf;
+
+	if (!b || !b->external || !b->buffers)
+		return -EINVAL;
+	if (index < 0 || index >= b->n_buffers)
+		return -EINVAL;
+
+	pthread_mutex_lock(&b->lock);
+	if (!b->external_out[index]) {
+		pthread_mutex_unlock(&b->lock);
+		/* Double-release: ignore (idempotent). */
+		return 0;
+	}
+	b->external_out[index] = 0;
+	pthread_mutex_unlock(&b->lock);
+
+	buf = b->buffers[index];
+	if (!buf)
+		return -EINVAL;
+
+	/* Match icamerasrc release_buffer: reset sequence/timestamp so the HAL
+	 * treats this as a fresh request and keeps 3A/PSYS producing. */
+	buf->sequence = -1;
+	buf->timestamp = 0;
+	if (camera_stream_qbuf(b->camera_id, &buf, 1, NULL) < 0) {
+		CAM_LOG_ERR(b, "camhal: release qbuf idx=%d failed", index);
+		return -EIO;
+	}
+	CAM_LOG_DEBUG(b, "camhal: released idx=%d", index);
+	return 0;
+}
+
 int camhal_backend_stop(struct camhal_backend *b)
 {
 	if (!b)
 		return -EINVAL;
 	if (b->running) {
-		/* Return any in-flight (dequeued-not-requeued) buffers to the HAL
-		 * before stopping, so the HAL has all its buffers back. */
-		pthread_mutex_lock(&b->lock);
-		while (b->inflight_count > 0) {
-			camera_buffer_t *oldest = b->inflight[b->inflight_head];
-			if (oldest) {
-				oldest->sequence = -1;
-				oldest->timestamp = 0;
-				camera_stream_qbuf(b->camera_id, &oldest, 1, NULL);
+		if (b->external) {
+			/* Direct mode: hand any dequeued-not-yet-released buffers
+			 * back to the HAL so it has all its buffers before stop. */
+			pthread_mutex_lock(&b->lock);
+			for (int i = 0; i < b->n_buffers; i++) {
+				if (b->external_out && b->external_out[i] &&
+				    b->buffers && b->buffers[i]) {
+					camera_buffer_t *one = b->buffers[i];
+					one->sequence = -1;
+					one->timestamp = 0;
+					camera_stream_qbuf(b->camera_id, &one, 1, NULL);
+					b->external_out[i] = 0;
+				}
 			}
-			b->inflight_head =
-				(b->inflight_head + 1) % INFLIGHT_DEPTH;
-			b->inflight_count--;
+			pthread_mutex_unlock(&b->lock);
+		} else {
+			/* Return any in-flight (dequeued-not-requeued) buffers to
+			 * the HAL before stopping, so the HAL has all its buffers. */
+			pthread_mutex_lock(&b->lock);
+			while (b->inflight_count > 0) {
+				camera_buffer_t *oldest = b->inflight[b->inflight_head];
+				if (oldest) {
+					oldest->sequence = -1;
+					oldest->timestamp = 0;
+					camera_stream_qbuf(b->camera_id, &oldest, 1, NULL);
+				}
+				b->inflight_head =
+					(b->inflight_head + 1) % INFLIGHT_DEPTH;
+				b->inflight_count--;
+			}
+			pthread_mutex_unlock(&b->lock);
 		}
-		pthread_mutex_unlock(&b->lock);
 		camera_device_stop(b->camera_id);
 		b->running = 0;
 	}
@@ -721,7 +1013,10 @@ void camhal_backend_destroy(struct camhal_backend *b)
 	if (b->buffers) {
 		for (int i = 0; i < b->n_buffers; i++) {
 			if (b->buffers[i]) {
-				if (b->buffers[i]->addr)
+				/* In external/direct mode the ->addr regions are
+				 * owned by the caller (the SPA output buffers) - do
+				 * NOT free them.  Only our own copy-mode buffers. */
+				if (!b->external && b->buffers[i]->addr)
 					free(b->buffers[i]->addr);
 				free(b->buffers[i]);
 			}
@@ -729,10 +1024,14 @@ void camhal_backend_destroy(struct camhal_backend *b)
 		free(b->buffers);
 		b->buffers = NULL;
 	}
+	free(b->external_out);
+	b->external_out = NULL;
+	CAM_LOG_INFO(b, "camhal: CLOSE camera %d (camera_device_close)", b->camera_id);
 	camera_device_close(b->camera_id);
 	free(b->prev_src);
 	b->prev_src = NULL;
 	hal_unref();
+	CAM_LOG_INFO(b, "camhal: DESTROY backend camera %d done (hal_unref)", b->camera_id);
 	pthread_mutex_destroy(&b->lock);
 	delete b;
 }

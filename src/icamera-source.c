@@ -145,6 +145,14 @@ struct impl {
 	bool capture_thread_running;
 	bool capture_stop;
 
+	/* R-A direct / zero-copy mode: when the HAL does not pad lines
+	 * (stride == width) the SPA output buffers double as the HAL's USERPTR
+	 * buffers, so the capture thread hands HAL-written memory straight to
+	 * the consumer with no memcpy.  true = direct mode active (backend was
+	 * configured via camhal_backend_configure_external and the capture
+	 * thread uses dqbuf_index/release); false = old copying path. */
+	bool zero_copy;
+
 	/* NV12 resolutions advertised by the HAL for this camera
 	 * (queried once during node init). */
 	struct camhal_resolution res[32];
@@ -385,6 +393,81 @@ static void *capture_thread_main(void *data)
 	return NULL;
 }
 
+/*
+ * Direct / zero-copy capture thread (R-A).  Used when the HAL does not pad
+ * lines and its USERPTR buffers ARE the SPA output buffers.  The HAL writes a
+ * frame straight into SPA buffer i; we just learn its index and hand it to the
+ * consumer with no memcpy, only releasing it back to the HAL (which re-queues
+ * it) once the consumer returns it via reuse_buffer.
+ *
+ * The pipeline is naturally backpressured: at most n_buffers USERPTR buffers
+ * are ever queued to the HAL, so once the consumer falls behind, dqbuf_index
+ * simply blocks until a buffer is released.
+ *
+ * NOTE: aligned to official icamerasrc USERPTR behaviour -- we do NOT drop or
+ * immediately re-queue any frame (no warmup immediate-release).  Like the
+ * reference plugin, every dequeued frame travels the full downstream lifecycle
+ * and is only handed back to the HAL via reuse_buffer, so the HAL always has
+ * several buffers flowing through its request/3A/PSYS pipeline driven purely
+ * by the consumer.  The black warm-up frames are simply delivered like the
+ * reference does it; exposure convergence is left to the consumer.
+ */
+static void *capture_thread_main_direct(void *data)
+{
+	struct impl *impl = data;
+
+	ICAM_LOG_DEBUG(impl, "DIRECT thread entered (zero-copy, official "
+		       "USERPTR-aligned: consumer-driven requeue only)");
+
+	while (!impl->capture_stop) {
+		int idx = -1;
+		uint64_t ts = 0;
+		int ret = camhal_backend_dqbuf_index(impl->backend, &idx, &ts);
+		if (ret < 0) {
+			if (impl->log)
+				spa_log_warn(impl->log,
+					     "camhal dqbuf_index failed: %d", ret);
+			if (impl->capture_stop)
+				break;
+			usleep(10000);
+			continue;
+		}
+		if (idx < 0 || idx >= (int)impl->out_port.n_buffers) {
+			continue;
+		}
+
+		struct frame *frame = &impl->out_port.buffers[idx];
+
+		/* Present the frame.  Set its pts on the monotonic clock for the
+		 * sink, mark it filled/outstanding, and queue it for process(). */
+		{
+			struct timespec mono;
+			clock_gettime(CLOCK_MONOTONIC, &mono);
+			frame->pts = (uint64_t)mono.tv_sec * SPA_NSEC_PER_SEC +
+				     (uint64_t)mono.tv_nsec;
+		}
+		if (frame->outbuf && frame->outbuf->n_datas > 0 &&
+		    frame->outbuf->datas[0].chunk)
+			frame->outbuf->datas[0].chunk->size =
+				(uint32_t)impl->out_port.data_size;
+
+		pthread_mutex_lock(&impl->out_port.queue_lock);
+		SPA_FLAG_SET(frame->flags, 1);
+		spa_list_append(&impl->out_port.queue, &frame->link);
+		{
+			static unsigned long dn = 0;
+			if ((++dn % 50) == 1)
+				ICAM_LOG_DEBUG(impl,
+					"DIRECT-APPEND #%lu idx=%d pts=%lu ts=%lu nbuf=%u",
+					dn, idx, (unsigned long)frame->pts,
+					(unsigned long)ts,
+					impl->out_port.n_buffers);
+		}
+		pthread_mutex_unlock(&impl->out_port.queue_lock);
+	}
+	return NULL;
+}
+
 /* Apply the (possibly freshly updated) 3A settings to the HAL backend if it
  * is already open.  Called from the dynamic set_param() path.  If the backend
  * is not open yet (not streaming), nothing is pushed here -- the lazily opened
@@ -431,32 +514,76 @@ static int camhal_start(struct impl *impl)
 	}
 
 	int stride = 0, size = 0;
-	if (camhal_backend_configure(impl->backend,
-				     impl->out_port.width,
-				     impl->out_port.height,
-				     MAX_BUFFERS,
-				     &stride, &size) < 0) {
-		if (impl->log)
-			spa_log_error(impl->log, "camhal configure failed");
-		return -EIO;
-	}
-	/* Stride handling (P0): the HAL may pad each line beyond the nominal
-	 * width (e.g. RGB-IR full resolution).  Keep the *packed* size (width*
-	 * height*3/2) as the data_size we negotiate/advertise downstream, but
-	 * remember the HAL's real bytes-per-line so the capture thread can copy
-	 * row-by-row and strip the padding (otherwise frames come out shifted /
-	 * green-striped).  hal_size is the padded frame size the HAL produces,
-	 * which is what tmpbuf must be able to hold. */
-	impl->out_port.stride = (uint32_t)stride;
-	impl->out_port.hal_size = (size_t)((size_t)impl->out_port.stride *
-					   impl->out_port.height * 3 / 2);
-	if (impl->out_port.hal_size < impl->out_port.data_size)
-		impl->out_port.hal_size = impl->out_port.data_size;
 
-	if (impl->tmpbuf == NULL)
-		impl->tmpbuf = malloc(impl->out_port.hal_size);
-	if (impl->tmpbuf == NULL)
-		return -ENOMEM;
+	/*
+	 * R-A direct / zero-copy: try to make the SPA output buffers double as
+	 * the HAL's USERPTR buffers.  This only works when the HAL does not pad
+	 * lines (stride == width); camhal_backend_configure_external returns
+	 * -EINVAL otherwise and we fall through to the copying path.
+	 */
+	impl->zero_copy = false;
+	if (impl->out_port.n_buffers > 0) {
+		void *addrs[MAX_BUFFERS];
+		int i;
+		bool all_map = true;
+		for (i = 0; i < (int)impl->out_port.n_buffers; i++) {
+			struct frame *f = &impl->out_port.buffers[i];
+			if (!f->outbuf || f->outbuf->n_datas < 1 ||
+			    f->outbuf->datas[0].data == NULL) {
+				all_map = false;
+				break;
+			}
+			addrs[i] = f->outbuf->datas[0].data;
+		}
+		if (all_map &&
+		    camhal_backend_configure_external(impl->backend,
+						      impl->out_port.width,
+						      impl->out_port.height,
+						      impl->out_port.n_buffers,
+						      addrs,
+						      impl->out_port.data_size,
+						      &stride, &size) == 0) {
+			/* Direct mode active: stride == width, so the packed
+			 * data_size is exactly what the HAL wrote. */
+			impl->zero_copy = true;
+			impl->out_port.stride = (uint32_t)stride;
+			impl->out_port.hal_size = impl->out_port.data_size;
+			ICAM_LOG_INFO(impl,
+				"icamera: DIRECT zero-copy %ux%u nbuf=%u (HAL writes "
+				"straight into SPA buffers, no memcpy)",
+				impl->out_port.width, impl->out_port.height,
+				impl->out_port.n_buffers);
+		}
+	}
+
+	if (!impl->zero_copy) {
+		if (camhal_backend_configure(impl->backend,
+					     impl->out_port.width,
+					     impl->out_port.height,
+					     MAX_BUFFERS,
+					     &stride, &size) < 0) {
+			if (impl->log)
+				spa_log_error(impl->log, "camhal configure failed");
+			return -EIO;
+		}
+		/* Stride handling (P0): the HAL may pad each line beyond the nominal
+		 * width (e.g. RGB-IR full resolution).  Keep the *packed* size (width*
+		 * height*3/2) as the data_size we negotiate/advertise downstream, but
+		 * remember the HAL's real bytes-per-line so the capture thread can copy
+		 * row-by-row and strip the padding (otherwise frames come out shifted /
+		 * green-striped).  hal_size is the padded frame size the HAL produces,
+		 * which is what tmpbuf must be able to hold. */
+		impl->out_port.stride = (uint32_t)stride;
+		impl->out_port.hal_size = (size_t)((size_t)impl->out_port.stride *
+						   impl->out_port.height * 3 / 2);
+		if (impl->out_port.hal_size < impl->out_port.data_size)
+			impl->out_port.hal_size = impl->out_port.data_size;
+
+		if (impl->tmpbuf == NULL)
+			impl->tmpbuf = malloc(impl->out_port.hal_size);
+		if (impl->tmpbuf == NULL)
+			return -ENOMEM;
+	}
 
 	ICAM_LOG_INFO(impl, "icamera: HAL %ux%u stride=%d packed=%zu hal=%zu",
 		      impl->out_port.width, impl->out_port.height, stride,
@@ -471,7 +598,9 @@ static int camhal_start(struct impl *impl)
 	impl->capture_stop = false;
 	impl->capture_thread_running = true;
 	if (pthread_create(&impl->capture_thread, NULL,
-			   capture_thread_main, impl) != 0) {
+			   impl->zero_copy ? capture_thread_main_direct
+					   : capture_thread_main,
+			   impl) != 0) {
 		impl->capture_thread_running = false;
 		return -EIO;
 	}
@@ -486,17 +615,41 @@ static int camhal_stop(struct impl *impl)
 		return 0;
 
 	impl->capture_stop = true;
+
+	/*
+	 * Stop the camera FIRST: camera_device_stop() unblocks a capture thread
+	 * parked inside camera_stream_dqbuf() (it returns -EIO, and the thread
+	 * breaks out on capture_stop).  Joining the thread before stopping the
+	 * HAL would deadlock forever if the thread is sitting in a blocking
+	 * dqbuf -- which is exactly the case when a consumer detaches while the
+	 * sensor is still streaming.
+	 */
+	if (impl->backend)
+		camhal_backend_stop(impl->backend);
+
 	if (impl->capture_thread_running) {
 		pthread_join(impl->capture_thread, NULL);
 		impl->capture_thread_running = false;
 	}
 
-	if (impl->backend)
-		camhal_backend_stop(impl->backend);
-
 	if (impl->tmpbuf) {
 		free(impl->tmpbuf);
 		impl->tmpbuf = NULL;
+	}
+
+	/*
+	 * Fully release the camera.  The HAL treats a camera as "opened/owned
+	 * until camera_device_close()" -- camera_device_stop() only pauses the
+	 * stream and leaves mCameraDevices[id] installed, so the camera stays
+	 * exclusively held (deviceOpen() later fails with "has already opened").
+	 * Destroying the backend closes the device and unrefs the HAL, so the
+	 * next consumer (or a fresh camhal_start) can reacquire the camera.  This
+	 * is why a stale backend made a second open/release cycle hang and only a
+	 * wireplumber restart (which tears the whole node down) would recover.
+	 */
+	if (impl->backend) {
+		camhal_backend_destroy(impl->backend);
+		impl->backend = NULL;
 	}
 
 	impl->active = false;
@@ -1126,6 +1279,22 @@ static int impl_node_port_use_buffers(void *object,
 	ICAM_LOG_INFO(impl, "use_buffers dir=%u port=%u flags=0x%x nbuf=%u",
 		      direction, port_id, flags, n_buffers);
 
+	/*
+	 * A consumer (gst/pipewire client) detaching from a source node without
+	 * an explicit Suspend shows up here as use_buffers(nbuf=0) -- pipewire
+	 * pulls the port's buffers back.  It does NOT route a
+	 * SPA_NODE_COMMAND_Suspend/Pause to a pure live source, so relying only
+	 * on camhal_stop() via send_command leaves the camera running and open
+	 * forever (the next consumer then gets a stale, still-active backend and
+	 * the pipeline hangs).  Treat nbuf==0 as "disconnect": tear the capture
+	 * down and release the camera so the next consumer can reacquire it.
+	 */
+	if (n_buffers == 0 && impl->active) {
+		ICAM_LOG_INFO(impl, "use_buffers: consumer disconnected -> stop "
+			      "capture & release camera");
+		camhal_stop(impl);
+	}
+
 	pthread_mutex_lock(&port->queue_lock);
 	if (port->n_buffers > 0)
 		icamera_clear_buffers(impl, port);
@@ -1222,6 +1391,13 @@ static int impl_node_port_reuse_buffer(void *object,
 		port->io->buffer_id = SPA_ID_INVALID;
 		port->io->status = SPA_STATUS_OK;
 	}
+
+	/* R-A direct / zero-copy: return the buffer to the HAL now that the
+	 * consumer is done with it.  In direct mode the SPA buffer slot index
+	 * IS the HAL's USERPTR index (they were configured 1:1), so handing it
+	 * back lets the HAL refill it with the next frame. */
+	if (impl->zero_copy && impl->backend)
+		camhal_backend_release(impl->backend, buffer_id);
 
 	{
 		static long nb = 0;
