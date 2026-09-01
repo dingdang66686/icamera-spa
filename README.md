@@ -8,6 +8,11 @@ PipeWire `Video/Source` 节点呈现给桌面/应用（如 Camera、Video 会议
 > 项目目标是替代传统 `icamerasrc`(GStreamer) 相机采集路径, 让相机节点直接进入
 > PipeWire 图, 并支持**运行时动态修改 3A 参数**（曝光/增益/AWB）而不必重启节点。
 
+> **开发方式声明**: 本项目采用 **Vibe Coding（AI 辅助生成）+ 人工审核、验证**的方式
+> 完成。核心代码由 AI 辅助编写生成, 经开发者逐段人工审查、交叉验证（构建编译、
+> 实机抓帧、动态 3A 闭环、日志/管线分析等）后确认。凡是会覆盖系统组件、重启服务或
+> 影响系统行为的改动, 均经过人工审批后才落地。
+
 ---
 
 ## 特性
@@ -221,14 +226,19 @@ pw-cli s $ID Props '{"params": ["api.icamera.gain", 400.0]}'
 
 ## 调试
 
-插件内保留了一些运行时诊断（streaming 统计、warmup 丢帧、buffer 复用等）输出到 stderr
-（journald）。通过
+插件内的运行时诊断（streaming 统计、warmup 丢帧、buffer 复用、3A 更新等）统一通过
+**标准 `spa_log` 通道**输出，因此会进入 PipeWire / journald，并可按组件与级别过滤
+（`SPA_DEBUG` / `PW_LOG`）：
 
 ```sh
-journalctl --user -f | grep icamera
+# 实时看插件日志（info 及以上）
+journalctl --user -f | grep -iE "icamera|camhal"
+
+# 想看到帧级 debug 诊断（warmup/统计/EMIT 等），开 debug 级别：
+SPA_DEBUG=4 systemctl --user restart wireplumber
 ```
 
-查看。这些日志后续会收敛为统一的 `spa_log` 级别（见"路线图"）。
+关键生命周期与 3A 更新为 `info` 级别，帧级高频统计为 `debug` 级别，`debug` 默认关闭。
 
 ---
 
@@ -240,8 +250,8 @@ journalctl --user -f | grep icamera
       未使用 `camhal_backend_configure()` 返回的 HAL 真实 stride。若 HAL 对某些
       分辨率（如 RGB-IR 全分辨率）加行 padding, 帧会产生错位/绿条。需把 HAL stride
       贯通到 format/buffers 协商并按 stride 逐行拷贝。
-- [ ] **P0 — 调试日志收敛**: 移除/压低每帧刷新的 `fprintf(stderr)` 诊断, 改用
-      `spa_log` 分级。
+- [x] **P0 — 调试日志收敛**: 已把所有 `fprintf(stderr)` 诊断收敛为 `spa_log` 分级
+      （info = 生命周期/3A 更新, debug = 帧级高频统计），可通过 `SPA_DEBUG` 过滤。
 - [ ] **P0→P1 — 帧率联动**: `EnumFormat`/`Format` 当前写死 `30fps`, 未与 3A
       `frame-rate` / HAL 实际 fps 联动。
 - [ ] **P1 — 多种像素格式**: 目前仅 NV12。支持 BGRx 等格式 / 转换, 以便 RGB-IR
