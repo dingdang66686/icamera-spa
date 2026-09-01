@@ -39,7 +39,8 @@ int main(void)
                 struct camhal_backend *b = camhal_backend_create(id, NULL);
                 if (!b) { printf("  create failed\n"); continue; }
                 int stride = 0, size = 0;
-                if (camhal_backend_configure(b, 640, 480, 4, &stride, &size) < 0) {
+                if (camhal_backend_configure(b, 0x3231564e /* NV12 */,
+                                             640, 480, 4, &stride, &size) < 0) {
                         printf("  configure failed\n"); camhal_backend_destroy(b); continue;
                 }
                 printf("  configure OK stride=%d size=%d\n", stride, size);

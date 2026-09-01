@@ -62,21 +62,27 @@ struct camhal_backend *camhal_backend_create(int camera_id,
 					     struct spa_log *log);
 
 /*
- * Query the frame size the HAL wants for (format NV12, width x height).
- * Optional; the plugin can also just assume width*height*3/2.
+ * Query the frame size the HAL wants for (format, width x height).
+ * \param format  V4L2 pixel fourcc (e.g. V4L2_PIX_FMT_NV12).  Optional; the
+ *                plugin can also compute the packed size itself.
  */
-long camhal_backend_get_frame_size(int camera_id, int width, int height);
+long camhal_backend_get_frame_size(int camera_id, uint32_t format,
+				   int width, int height);
 
-/* One supported NV12 video resolution advertised by the HAL. */
+/* One pixel format + video resolution the HAL advertises.  format is a V4L2
+ * pixel fourcc ('NV12' = 0x3231564e, 'YUYV', ...).  The same width x height
+ * may appear several times with different formats; each is a distinct entry. */
 struct camhal_resolution {
+	uint32_t format;	/* V4L2 pixel fourcc as reported by the HAL */
 	uint32_t width;
 	uint32_t height;
 };
 
 /*
- * Enumerate the NV12 resolutions the HAL actually supports for the given
- * camera.  Fills at most \a max_count entries into \a outs and returns the
- * number written (<= max_count).  Returns negative errno on failure.
+ * Enumerate the pixel formats + resolutions the HAL actually supports for the
+ * given camera (querying getSupportedStreamConfig(), NOT hardcoded to NV12).
+ * Fills at most \a max_count entries into \a outs and returns the number
+ * written (<= max_count).  Returns negative errno on failure.
  * \param log  optional SPA logging interface for diagnostics (may be NULL).
  *
  * This queries getSupportedStreamConfig(), so it does NOT open the camera
@@ -120,10 +126,13 @@ int camhal_backend_set_3a(struct camhal_backend *b,
 
 /*
  * Configure the stream.  Must be called once, while stopped.
+ * \param format   V4L2 pixel fourcc the stream must use (as advertised by
+ *                 camhal_backend_get_supported_formats).
  * width/height in pixels, n_buffers = number of streaming buffers.
  * \param out_stride receives the bytes-per-line the HAL will use.
  */
 int camhal_backend_configure(struct camhal_backend *b,
+			     uint32_t format,
 			     int width, int height,
 			     int n_buffers,
 			     int *out_stride, int *out_size);
@@ -171,6 +180,7 @@ int camhal_backend_dqbuf(struct camhal_backend *b,
  * memory type cannot be used, or a negative errno.
  */
 int camhal_backend_configure_external(struct camhal_backend *b,
+				      uint32_t format,
 				      int width, int height,
 				      int n_buffers,
 				      void **addrs, size_t addr_size,
@@ -234,6 +244,7 @@ int camhal_backend_release(struct camhal_backend *b, int index);
  * negative errno.
  */
 int camhal_backend_configure_dmabuf(struct camhal_backend *b,
+				    uint32_t format,
 				    int width, int height,
 				    int n_buffers,
 				    int *fds,

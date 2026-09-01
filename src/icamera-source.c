@@ -102,6 +102,86 @@
 #define GET_OUT_PORT(i) (&(i)->out_port)
 
 /* ------------------------------------------------------------------ */
+/* Pixel-format helpers                                                */
+/*                                                                     */
+/* The libcamhal backend reports stream pixel formats as V4L2 fourcc   */
+/* values (e.g. 'NV12' = 0x3231564e).  The plugin negotiates with      */
+/* PipeWire in SPA_VIDEO_FORMAT_* terms.  We keep the negotiated       */
+/* format as a V4L2 fourcc in struct port (and in impl->res[]) because */
+/* that is what the backend/stream table speaks; these helpers map     */
+/* between the two spaces and compute packed frame sizes.  Formats the */
+/* HAL could never emit are simply not advertised (set_param rejects   */
+/* them), so only real sensor formats are ever negotiated.             */
+/* ------------------------------------------------------------------ */
+
+#define V4L2_FOURCC(a, b, c, d) \
+	((uint32_t)(a) | ((uint32_t)(b) << 8) | \
+	 ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+
+/* Map a V4L2 pixel fourcc to the equivalent SPA_VIDEO_FORMAT_* id, or
+ * SPA_VIDEO_FORMAT_UNKNOWN when we do not represent it in SPA. */
+static uint32_t v4l2_fourcc_to_spa(uint32_t fourcc)
+{
+	switch (fourcc) {
+	case V4L2_FOURCC('N', 'V', '1', '2'): return SPA_VIDEO_FORMAT_NV12;
+	case V4L2_FOURCC('N', 'V', '2', '1'): return SPA_VIDEO_FORMAT_NV21;
+	case V4L2_FOURCC('Y', 'U', 'Y', 'V'): return SPA_VIDEO_FORMAT_YUY2;
+	case V4L2_FOURCC('U', 'Y', 'V', 'Y'): return SPA_VIDEO_FORMAT_UYVY;
+	case V4L2_FOURCC('Y', 'U', '1', '2'): return SPA_VIDEO_FORMAT_I420;
+	case V4L2_FOURCC('Y', 'V', '1', '2'): return SPA_VIDEO_FORMAT_YV12;
+	case V4L2_FOURCC('G', 'R', 'E', 'Y'): return SPA_VIDEO_FORMAT_GRAY8;
+	case V4L2_FOURCC('R', 'G', 'B', '3'): return SPA_VIDEO_FORMAT_RGB;
+	case V4L2_FOURCC('B', 'G', 'R', '3'): return SPA_VIDEO_FORMAT_BGR;
+	case V4L2_FOURCC('R', 'G', 'B', 'P'): return SPA_VIDEO_FORMAT_RGB16;
+	default:                              return SPA_VIDEO_FORMAT_UNKNOWN;
+	}
+}
+
+/* Map a negotiated SPA_VIDEO_FORMAT_* id back to its V4L2 fourcc, or 0
+ * when unknown.  Inverse of v4l2_fourcc_to_spa() for the formats above. */
+static uint32_t spa_format_to_v4l2_fourcc(uint32_t fmt)
+{
+	switch (fmt) {
+	case SPA_VIDEO_FORMAT_NV12:  return V4L2_FOURCC('N', 'V', '1', '2');
+	case SPA_VIDEO_FORMAT_NV21:  return V4L2_FOURCC('N', 'V', '2', '1');
+	case SPA_VIDEO_FORMAT_YUY2:  return V4L2_FOURCC('Y', 'U', 'Y', 'V');
+	case SPA_VIDEO_FORMAT_UYVY:  return V4L2_FOURCC('U', 'Y', 'V', 'Y');
+	case SPA_VIDEO_FORMAT_I420:  return V4L2_FOURCC('Y', 'U', '1', '2');
+	case SPA_VIDEO_FORMAT_YV12:  return V4L2_FOURCC('Y', 'V', '1', '2');
+	case SPA_VIDEO_FORMAT_GRAY8: return V4L2_FOURCC('G', 'R', 'E', 'Y');
+	case SPA_VIDEO_FORMAT_RGB:   return V4L2_FOURCC('R', 'G', 'B', '3');
+	case SPA_VIDEO_FORMAT_BGR:   return V4L2_FOURCC('B', 'G', 'R', '3');
+	case SPA_VIDEO_FORMAT_RGB16: return V4L2_FOURCC('R', 'G', 'B', 'P');
+	default:                     return 0;
+	}
+}
+
+/* Packed byte size of a V4L2 fourcc frame (no line padding).  Handles the
+ * formats we advertise; unknown formats fall back to 3 bytes/pixel. */
+static size_t v4l2_format_size(uint32_t fourcc, uint32_t w, uint32_t h)
+{
+	size_t px = (size_t)w * h;
+	switch (fourcc) {
+	case V4L2_FOURCC('N', 'V', '1', '2'):
+	case V4L2_FOURCC('N', 'V', '2', '1'):
+	case V4L2_FOURCC('Y', 'U', '1', '2'):
+	case V4L2_FOURCC('Y', 'V', '1', '2'):
+		return px * 3 / 2;
+	case V4L2_FOURCC('Y', 'U', 'Y', 'V'):
+	case V4L2_FOURCC('U', 'Y', 'V', 'Y'):
+	case V4L2_FOURCC('R', 'G', 'B', 'P'):
+		return px * 2;
+	case V4L2_FOURCC('R', 'G', 'B', '3'):
+	case V4L2_FOURCC('B', 'G', 'R', '3'):
+		return px * 3;
+	case V4L2_FOURCC('G', 'R', 'E', 'Y'):
+		return px;
+	default:
+		return px * 3;
+	}
+}
+
+/* ------------------------------------------------------------------ */
 /* The frame queue shared between the libcamhal producer thread and    */
 /* the driver/consumer thread (spa_node.process).                      */
 /* ------------------------------------------------------------------ */
@@ -120,9 +200,10 @@ struct frame {
 
 struct port {
 	uint32_t width, height;
+	uint32_t format;	/* negotiated V4L2 pixel fourcc (see helpers above) */
 	uint32_t stride;	/* HAL bytes-per-line (may be > width for padding) */
-	size_t data_size;	/* packed output size = width * height * 3/2 */
-	size_t hal_size;	/* padded HAL frame size = stride * height * 3/2 */
+	size_t data_size;	/* packed output size for the negotiated format */
+	size_t hal_size;	/* padded HAL frame size for the negotiated format */
 	bool have_format;
 
 	/* R-B dma-mode: when the peer negotiates SPA_DATA_DmaBuf we back the
@@ -185,8 +266,9 @@ struct impl {
 	 * thread uses dqbuf_index/release); false = old copying path. */
 	bool zero_copy;
 
-	/* NV12 resolutions advertised by the HAL for this camera
-	 * (queried once during node init). */
+	/* Pixel formats + resolutions advertised by the HAL for this camera
+	 * (queried once during node init).  Each entry carries a V4L2 fourcc
+	 * (res[i].format) plus its resolution. */
 	struct camhal_resolution res[32];
 	int n_res;
 
@@ -637,6 +719,7 @@ static int camhal_start(struct impl *impl)
 		}
 		if (all_fd &&
 		    camhal_backend_configure_dmabuf(impl->backend,
+						     impl->out_port.format,
 						     impl->out_port.width,
 						     impl->out_port.height,
 						     impl->out_port.n_buffers,
@@ -682,6 +765,7 @@ static int camhal_start(struct impl *impl)
 		}
 		if (all_map &&
 		    camhal_backend_configure_external(impl->backend,
+						      impl->out_port.format,
 						      impl->out_port.width,
 						      impl->out_port.height,
 						      impl->out_port.n_buffers,
@@ -703,6 +787,7 @@ static int camhal_start(struct impl *impl)
 
 	if (!impl->zero_copy) {
 		if (camhal_backend_configure(impl->backend,
+					     impl->out_port.format,
 					     impl->out_port.width,
 					     impl->out_port.height,
 					     MAX_BUFFERS,
@@ -712,15 +797,21 @@ static int camhal_start(struct impl *impl)
 			return -EIO;
 		}
 		/* Stride handling (P0): the HAL may pad each line beyond the nominal
-		 * width (e.g. RGB-IR full resolution).  Keep the *packed* size (width*
-		 * height*3/2) as the data_size we negotiate/advertise downstream, but
-		 * remember the HAL's real bytes-per-line so the capture thread can copy
-		 * row-by-row and strip the padding (otherwise frames come out shifted /
-		 * green-striped).  hal_size is the padded frame size the HAL produces,
-		 * which is what tmpbuf must be able to hold. */
+		 * width (e.g. RGB-IR full resolution).  Keep the *packed* size (for the
+		 * negotiated format) as the data_size we negotiate/advertise
+		 * downstream, but remember the HAL's real bytes-per-line so the capture
+		 * thread can copy row-by-row and strip the padding (otherwise frames
+		 * come out shifted / green-striped).  hal_size is the padded frame size
+		 * the HAL produces -- data_size scaled by stride/width -- which is what
+		 * tmpbuf must be able to hold. */
 		impl->out_port.stride = (uint32_t)stride;
-		impl->out_port.hal_size = (size_t)((size_t)impl->out_port.stride *
-						   impl->out_port.height * 3 / 2);
+		{
+			uint64_t padded = ((uint64_t)impl->out_port.data_size *
+					   impl->out_port.stride +
+					   impl->out_port.width - 1) /
+					  impl->out_port.width;
+			impl->out_port.hal_size = (size_t)padded;
+		}
 		if (impl->out_port.hal_size < impl->out_port.data_size)
 			impl->out_port.hal_size = impl->out_port.data_size;
 
@@ -838,19 +929,28 @@ static void icamera_update_framerate(struct impl *impl)
 	icamera_fps_to_fraction(impl->s3a.frame_rate, &impl->out_framerate);
 }
 
-/* Build one NV12 EnumFormat pod for the given resolution index.
- * Returns 0 on success, <0 on error. */
+/* Build one EnumFormat pod for the given (format,resolution) index.
+ * Returns 0 on success, <0 on error (or when the format is not mappable
+ * to a SPA_VIDEO_FORMAT, in which case we skip advertising it). */
 static int build_enum_format(struct impl *impl, struct spa_pod_builder *b,
 			     int idx, struct spa_pod **out)
 {
+	uint32_t spa_fmt;
+
 	if (idx >= impl->n_res)
+		return -ENOENT;
+
+	/* Only advertise formats we can represent in SPA.  The HAL only
+	 * reports NV12 today, but this keeps the enumeration generic. */
+	spa_fmt = v4l2_fourcc_to_spa(impl->res[idx].format);
+	if (spa_fmt == SPA_VIDEO_FORMAT_UNKNOWN)
 		return -ENOENT;
 
 	*out = spa_pod_builder_add_object(b,
 		SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
 		SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
 		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-		SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_NV12),
+		SPA_FORMAT_VIDEO_format, SPA_POD_Id(spa_fmt),
 		SPA_FORMAT_VIDEO_size,   SPA_POD_CHOICE_RANGE_Rectangle(
 			&SPA_RECTANGLE(impl->res[idx].width, impl->res[idx].height),
 			&SPA_RECTANGLE(impl->res[idx].width, impl->res[idx].height),
@@ -942,7 +1042,7 @@ next:
 		{
 			struct spa_video_info_raw ri;
 			memset(&ri, 0, sizeof(ri));
-			ri.format = SPA_VIDEO_FORMAT_NV12;
+			ri.format = v4l2_fourcc_to_spa(impl->out_port.format);
 			ri.size = SPA_RECTANGLE(impl->out_port.width, impl->out_port.height);
 			ri.framerate = impl->out_framerate;
 			param = spa_format_video_raw_build(&b, id, &ri);
@@ -1187,20 +1287,14 @@ next:
 
 	switch (id) {
 	case SPA_PARAM_EnumFormat:
-		if (result.index > 0)
-			return 0;
-		param = spa_pod_builder_add_object(&b,
-			SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-			SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
-			SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-			SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_NV12),
-			SPA_FORMAT_VIDEO_size,   SPA_POD_CHOICE_RANGE_Rectangle(
-				&SPA_RECTANGLE(impl->res[0].width, impl->res[0].height),
-				&SPA_RECTANGLE(impl->res[0].width, impl->res[0].height),
-				&SPA_RECTANGLE(impl->res[0].width, impl->res[0].height)),
-			SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-				&impl->out_framerate, &impl->out_framerate,
-				&impl->out_framerate));
+		/* Advertise every (format x resolution) the HAL supports.  The
+		 * index just walks impl->res[]; build_enum_format already skips
+		 * any format we cannot represent in SPA. */
+		{
+			int rr = build_enum_format(impl, &b, result.index, &param);
+			if (rr < 0)
+				return 0;
+		}
 		break;
 	case SPA_PARAM_Format:
 		if (!port->have_format)
@@ -1210,7 +1304,7 @@ next:
 		{
 			struct spa_video_info_raw ri;
 			memset(&ri, 0, sizeof(ri));
-			ri.format = SPA_VIDEO_FORMAT_NV12;
+			ri.format = v4l2_fourcc_to_spa(port->format);
 			ri.size = SPA_RECTANGLE(port->width, port->height);
 			ri.framerate = impl->out_framerate;
 			param = spa_format_video_raw_build(&b, id, &ri);
@@ -1281,6 +1375,8 @@ static int impl_node_port_set_param(void *object,
 	struct impl *impl = object;
 	struct port *port = GET_OUT_PORT(impl);
 	struct spa_video_info info = { 0 };
+	uint32_t fourcc, spa_fmt;
+	int i;
 	int res;
 
 	if (id != SPA_PARAM_Format)
@@ -1299,13 +1395,41 @@ static int impl_node_port_set_param(void *object,
 	if (spa_format_video_raw_parse(param, &info.info.raw) < 0)
 		return -EINVAL;
 
-	if (info.info.raw.format != SPA_VIDEO_FORMAT_NV12 ||
-	    info.info.raw.size.width == 0 || info.info.raw.size.height == 0)
+	if (info.info.raw.size.width == 0 || info.info.raw.size.height == 0)
 		return -EINVAL;
 
+	/* Accept any format we can map back to a V4L2 fourcc AND that the HAL
+	 * actually advertises for this camera (res[]), so we only ever negotiate
+	 * something the backend can really produce.  The HAL reports only NV12
+	 * today, but this keeps the negotiation generic for future sensors. */
+	spa_fmt = info.info.raw.format;
+	fourcc = spa_format_to_v4l2_fourcc(spa_fmt);
+	if (fourcc == 0) {
+		if (impl->log)
+			spa_log_warn(impl->log,
+				"icamera: reject format id=%d (not mappable to "
+				"a V4L2 fourcc)", spa_fmt);
+		return -EINVAL;
+	}
+	for (i = 0; i < impl->n_res; i++) {
+		if (impl->res[i].format == fourcc &&
+		    impl->res[i].width == info.info.raw.size.width &&
+		    impl->res[i].height == info.info.raw.size.height)
+			break;
+	}
+	if (i >= impl->n_res) {
+		if (impl->log)
+			spa_log_warn(impl->log,
+				"icamera: reject fourcc=0x%x %ux%u (not in HAL "
+				"supported set)", fourcc,
+				info.info.raw.size.width, info.info.raw.size.height);
+		return -EINVAL;
+	}
+
+	port->format = fourcc;
 	port->width = info.info.raw.size.width;
 	port->height = info.info.raw.size.height;
-	port->data_size = (size_t)port->width * port->height * 3 / 2;
+	port->data_size = v4l2_format_size(fourcc, port->width, port->height);
 	port->have_format = true;
 	return 0;
 }
@@ -1996,10 +2120,10 @@ static int impl_init(const struct spa_handle_factory *factory,
 	 * (e.g. a separate icamerasrc) from opening the same device even when
 	 * we are not streaming.  Keep impl->backend == NULL until Start. */
 
-	/* Query the resolutions the HAL actually supports for this camera.
-	 * getSupportedStreamConfig() does not open the device, so this is safe
-	 * during node init.  Use the first NV12 resolution as the default so we
-	 * no longer hardcode 640x480. */
+	/* Query the formats + resolutions the HAL actually supports for this
+	 * camera.  getSupportedStreamConfig() does not open the device, so this
+	 * is safe during node init.  Use the first advertised (format,size) as
+	 * the default so we no longer hardcode 640x480/NV12. */
 	impl->n_res = camhal_backend_get_supported_formats(impl->camera_id,
 							   impl->res,
 							   (int)(sizeof(impl->res) /
@@ -2008,13 +2132,17 @@ static int impl_init(const struct spa_handle_factory *factory,
 	if (impl->n_res <= 0) {
 		/* Fall back to a sane default if enumeration failed. */
 		impl->n_res = 1;
+		impl->res[0].format = V4L2_FOURCC('N', 'V', '1', '2');
 		impl->res[0].width  = 640;
 		impl->res[0].height = 480;
 	}
 
-	impl->out_port.width  = impl->res[0].width;
-	impl->out_port.height = impl->res[0].height;
-	impl->out_port.data_size = impl->res[0].width * impl->res[0].height * 3 / 2;
+	impl->out_port.format    = impl->res[0].format;
+	impl->out_port.width     = impl->res[0].width;
+	impl->out_port.height    = impl->res[0].height;
+	impl->out_port.data_size = v4l2_format_size(impl->out_port.format,
+						    impl->out_port.width,
+						    impl->out_port.height);
 	impl->out_port.have_format = false;
 	impl->out_port.n_buffers = 0;
 	memset(impl->out_port.buffers, 0, sizeof(impl->out_port.buffers));

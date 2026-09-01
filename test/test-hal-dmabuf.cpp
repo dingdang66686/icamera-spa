@@ -102,7 +102,8 @@ int main(void)
 	struct camhal_backend *b = camhal_backend_create(cam, NULL);
 	if (!b) { printf("backend create failed\n"); return 1; }
 	int stride = 0, size = 0;
-	if (camhal_backend_configure_dmabuf(b, W, H, N_BUF, fds, &stride, &size) < 0) {
+	if (camhal_backend_configure_dmabuf(b, 0x3231564e /* NV12 */,
+					    W, H, N_BUF, fds, &stride, &size) < 0) {
 		printf("configure_dmabuf FAILED (dma-mode declined?)\n");
 		camhal_backend_destroy(b);
 		return 1;
@@ -159,7 +160,8 @@ int main(void)
 	{
 		struct camhal_backend *cb = camhal_backend_create(cam, NULL);
 		int cs = 0, cstride = 0;
-		if (cb && camhal_backend_configure(cb, W, H, 6, &cstride, &cs) == 0 &&
+		if (cb && camhal_backend_configure(cb, 0x3231564e /* NV12 */,
+						   W, H, 6, &cstride, &cs) == 0 &&
 		    camhal_backend_start(cb) == 0) {
 			void *cptr = malloc((size_t)cs);
 			uint8_t *raw = (uint8_t *)cptr;

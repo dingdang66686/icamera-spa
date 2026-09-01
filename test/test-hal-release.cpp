@@ -32,7 +32,8 @@ static int cycle(int camera_id, int seq)
 	printf("[%s] opened camera %d\n", label, camera_id);
 
 	int stride = 0, size = 0;
-	if (camhal_backend_configure(b, 640, 480, 6, &stride, &size) < 0) {
+	if (camhal_backend_configure(b, 0x3231564e /* NV12 */,
+				     640, 480, 6, &stride, &size) < 0) {
 		printf("[%s] configure failed\n", label);
 		camhal_backend_destroy(b);
 		return 1;

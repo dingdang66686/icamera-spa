@@ -25,7 +25,8 @@ int main(void)
 
 		int stride=0, size=0;
 		printf("  === configure(640x480 x4) ===\n");
-		int r = camhal_backend_configure(b, 640, 480, 4, &stride, &size);
+		int r = camhal_backend_configure(b, 0x3231564e /* NV12 */,
+						 640, 480, 4, &stride, &size);
 		printf("  configure -> %d (stride=%d size=%d)\n", r, stride, size);
 
 		printf("  === start ===\n");

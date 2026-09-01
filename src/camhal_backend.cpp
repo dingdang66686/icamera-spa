@@ -57,6 +57,39 @@ using namespace icamera;
 	do { if ((b) && (b)->log) spa_log_debug((b)->log, __VA_ARGS__); } while (0)
 
 /* ------------------------------------------------------------------ */
+/* Per-format packed frame-size helper.                                */
+/*                                                                     */
+/* Computes the nominal byte size of a packed frame for a V4L2 pixel   */
+/* fourcc (no line padding).  Used as a fallback when the HAL does not */
+/* give us an exact stream size (e.g. a hand-built fallback stream).   */
+/* ------------------------------------------------------------------ */
+static size_t camhal_packed_size(uint32_t fourcc, uint32_t w, uint32_t h)
+{
+	size_t px = (size_t)w * h;
+	switch (fourcc) {
+	case V4L2_PIX_FMT_NV12:   /* Y plane + interleaved UV */
+	case V4L2_PIX_FMT_NV21:
+	case V4L2_PIX_FMT_YUV420: /* I420: Y + U + V */
+	case V4L2_PIX_FMT_YVU420: /* YV12: Y + V + U */
+		return px * 3 / 2;
+	case V4L2_PIX_FMT_YUYV:   /* 2 bytes / pixel */
+	case V4L2_PIX_FMT_UYVY:
+	case V4L2_PIX_FMT_RGB565:
+	case V4L2_PIX_FMT_YUV422P:
+		return px * 2;
+	case V4L2_PIX_FMT_RGB24:  /* 3 bytes / pixel */
+	case V4L2_PIX_FMT_BGR24:
+		return px * 3;
+	case V4L2_PIX_FMT_GREY:   /* 1 byte / pixel */
+		return px;
+	default:
+		/* Unknown format: fall back to 3 bytes / pixel so callers always
+		 * get a non-zero, conservative size. */
+		return px * 3;
+	}
+}
+
+/* ------------------------------------------------------------------ */
 /* Global, ref-counted camera_hal_init/deinit so multiple SPA node      */
 /* instances (one per real camera) can share the singleton safely.      */
 /* ------------------------------------------------------------------ */
@@ -219,10 +252,11 @@ void camhal_free_cameras(struct camhal_camera_info *cams, int count)
 	pthread_mutex_t lock;
 };
 
-long camhal_backend_get_frame_size(int camera_id, int width, int height)
+long camhal_backend_get_frame_size(int camera_id, uint32_t format,
+				   int width, int height)
 {
 	int bpp = 0;
-	return get_frame_size(camera_id, V4L2_PIX_FMT_NV12, width, height,
+	return get_frame_size(camera_id, format, width, height,
 			      V4L2_FIELD_ANY, &bpp);
 }
 
@@ -243,32 +277,39 @@ int camhal_backend_get_supported_formats(int camera_id,
 	configs.clear();
 	cinfo.capability->getSupportedStreamConfig(configs);
 
+	/* Enumerate every distinct (format, width, height) the HAL advertises,
+	 * for whatever pixel format it reports (not just NV12). */
 	int n = 0;
 	for (size_t i = 0; i < configs.size() && n < max_count; i++) {
-		if (configs[i].format != V4L2_PIX_FMT_NV12)
-			continue;
-		/* Skip redundant duplicate resolutions (same size twice). */
+		/* Skip redundant duplicate entries (same format/size twice). */
 		int dup = 0;
 		for (int j = 0; j < n; j++) {
-			if (outs[j].width == (uint32_t)configs[i].width &&
-			    outs[j].height == (uint32_t)configs[i].height) {
+			if (outs[j].format  == (uint32_t)configs[i].format &&
+			    outs[j].width   == (uint32_t)configs[i].width &&
+			    outs[j].height  == (uint32_t)configs[i].height) {
 				dup = 1;
 				break;
 			}
 		}
 		if (dup)
 			continue;
+		outs[n].format = configs[i].format;
 		outs[n].width  = configs[i].width;
 		outs[n].height = configs[i].height;
 		n++;
 	}
 
 	if (log)
-		spa_log_info(log, "camhal: camera %d supports %d NV12 resolution(s)",
+		spa_log_info(log, "camhal: camera %d advertises %d format/size combo(s)",
 			     camera_id, n);
 	for (int i = 0; i < n && log; i++)
-		spa_log_debug(log, "camhal:   [%d] %ux%u",
-			      i, outs[i].width, outs[i].height);
+		spa_log_debug(log, "camhal:   [%d] fourcc='%c%c%c%c' %ux%u",
+			      i,
+			      (char)(outs[i].format & 0xff),
+			      (char)((outs[i].format >> 8) & 0xff),
+			      (char)((outs[i].format >> 16) & 0xff),
+			      (char)((outs[i].format >> 24) & 0xff),
+			      outs[i].width, outs[i].height);
 
 	return n;
 }
@@ -651,6 +692,7 @@ err_free_buffers:
 #endif /* ENABLE_DMA_BUF */
 
 int camhal_backend_configure(struct camhal_backend *b,
+			     uint32_t format,
 			     int width, int height,
 			     int n_buffers,
 			     int *out_stride, int *out_size)
@@ -658,7 +700,7 @@ int camhal_backend_configure(struct camhal_backend *b,
 	if (!b)
 		return -EINVAL;
 
-	/* Find the full, HAL-known stream description for (NV12, width x height).
+	/* Find the full, HAL-known stream description for (format, width x height).
 	 * icamerasrc does exactly this via getSupportedStreamConfig() and copies
 	 * the whole stream_t (including stride/size/field/usage) into the array
 	 * passed to camera_device_config_streams().  If we hand the HAL a
@@ -675,7 +717,7 @@ int camhal_backend_configure(struct camhal_backend *b,
 		configs.clear();
 		cinfo.capability->getSupportedStreamConfig(configs);
 		for (size_t i = 0; i < configs.size(); i++) {
-			if (configs[i].format == V4L2_PIX_FMT_NV12 &&
+			if ((uint32_t)configs[i].format == format &&
 			    configs[i].width == (uint32_t)width &&
 			    configs[i].height == (uint32_t)height) {
 				stream = configs[i];
@@ -685,9 +727,10 @@ int camhal_backend_configure(struct camhal_backend *b,
 		}
 	}
 	if (!found) {
-		CAM_LOG_WARN(b, "camhal: no supported NV12 %dx%d stream, "
-			     "falling back to hand-built stream", width, height);
-		stream.format    = V4L2_PIX_FMT_NV12;
+		CAM_LOG_WARN(b, "camhal: no supported fourcc=0x%x %dx%d stream, "
+			     "falling back to hand-built stream", format,
+			     width, height);
+		stream.format    = format;
 		stream.width     = width;
 		stream.height    = height;
 		stream.field     = V4L2_FIELD_ANY;
@@ -695,9 +738,10 @@ int camhal_backend_configure(struct camhal_backend *b,
 		stream.streamType = CAMERA_STREAM_OUTPUT;
 		stream.usage     = CAMERA_STREAM_VIDEO_CAPTURE;
 		stream.size      = (uint32_t)camhal_backend_get_frame_size(
-			b->camera_id, width, height);
+			b->camera_id, format, width, height);
 		if (stream.size <= 0)
-			stream.size = (uint32_t)((size_t)width * height * 3 / 2);
+			stream.size = (uint32_t)camhal_packed_size(
+				format, width, height);
 	}
 	/* Use USERPTR memory (icamerasrc default); MMAP is only for ISYS
 	 * output sensors and fails here.  The plugin memcpys the frame out
@@ -908,6 +952,7 @@ int camhal_backend_dqbuf(struct camhal_backend *b,
 }
 
 int camhal_backend_configure_external(struct camhal_backend *b,
+				      uint32_t format,
 				      int width, int height,
 				      int n_buffers,
 				      void **addrs, size_t addr_size,
@@ -918,7 +963,7 @@ int camhal_backend_configure_external(struct camhal_backend *b,
 	if (!b || !addrs || n_buffers <= 0)
 		return -EINVAL;
 
-	/* Find the full, HAL-known stream description for (NV12, width x height),
+	/* Find the full, HAL-known stream description for (format, width x height),
 	 * mirroring camhal_backend_configure.  We need the real table entry so
 	 * stride/size come back correct for the zero-copy check. */
 	camera_info_t cinfo;
@@ -932,7 +977,7 @@ int camhal_backend_configure_external(struct camhal_backend *b,
 		configs.clear();
 		cinfo.capability->getSupportedStreamConfig(configs);
 		for (size_t i = 0; i < configs.size(); i++) {
-			if (configs[i].format == V4L2_PIX_FMT_NV12 &&
+			if ((uint32_t)configs[i].format == format &&
 			    configs[i].width == (uint32_t)width &&
 			    configs[i].height == (uint32_t)height) {
 				stream = configs[i];
@@ -942,8 +987,8 @@ int camhal_backend_configure_external(struct camhal_backend *b,
 		}
 	}
 	if (!found) {
-		CAM_LOG_WARN(b, "camhal: external: no supported NV12 %dx%d stream",
-			     width, height);
+		CAM_LOG_WARN(b, "camhal: external: no supported fourcc=0x%x %dx%d "
+			     "stream", format, width, height);
 		return -EINVAL;
 	}
 	stream.memType = V4L2_MEMORY_USERPTR;
@@ -989,7 +1034,8 @@ int camhal_backend_configure_external(struct camhal_backend *b,
 	b->stream_width = width;
 	b->stream_height = height;
 	b->stream_size = stream.size > 0 ? (int)stream.size
-					: (int)((size_t)width * height * 3 / 2);
+					: (int)camhal_packed_size(
+						format, width, height);
 	b->stream_stride = stride;
 	b->n_buffers = n_buffers;
 
@@ -1011,6 +1057,7 @@ int camhal_backend_configure_external(struct camhal_backend *b,
 
 #if ENABLE_DMA_BUF
 int camhal_backend_configure_dmabuf(struct camhal_backend *b,
+				    uint32_t format,
 				    int width, int height,
 				    int n_buffers,
 				    int *fds,
@@ -1021,7 +1068,7 @@ int camhal_backend_configure_dmabuf(struct camhal_backend *b,
 	if (!b || !fds || n_buffers <= 0)
 		return -EINVAL;
 
-	/* Find the full, HAL-known stream description for (NV12, width x height),
+	/* Find the full, HAL-known stream description for (format, width x height),
 	 * mirroring camhal_backend_configure / _external. */
 	camera_info_t cinfo;
 	memset(&cinfo, 0, sizeof(cinfo));
@@ -1034,7 +1081,7 @@ int camhal_backend_configure_dmabuf(struct camhal_backend *b,
 		configs.clear();
 		cinfo.capability->getSupportedStreamConfig(configs);
 		for (size_t i = 0; i < configs.size(); i++) {
-			if (configs[i].format == V4L2_PIX_FMT_NV12 &&
+			if ((uint32_t)configs[i].format == format &&
 			    configs[i].width == (uint32_t)width &&
 			    configs[i].height == (uint32_t)height) {
 				stream = configs[i];
@@ -1044,8 +1091,8 @@ int camhal_backend_configure_dmabuf(struct camhal_backend *b,
 		}
 	}
 	if (!found) {
-		CAM_LOG_WARN(b, "camhal: dma-mode: no supported NV12 %dx%d stream",
-			     width, height);
+		CAM_LOG_WARN(b, "camhal: dma-mode: no supported fourcc=0x%x %dx%d "
+			     "stream", format, width, height);
 		return -EINVAL;
 	}
 	stream.memType = V4L2_MEMORY_DMABUF;
@@ -1086,7 +1133,8 @@ int camhal_backend_configure_dmabuf(struct camhal_backend *b,
 	b->stream_width = width;
 	b->stream_height = height;
 	b->stream_size = stream.size > 0 ? (int)stream.size
-					: (int)((size_t)width * height * 3 / 2);
+					: (int)camhal_packed_size(
+						format, width, height);
 	b->stream_stride = stride;
 	b->n_buffers = n_buffers;
 
