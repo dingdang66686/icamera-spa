@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+
+# Compiled test binaries
+dyn3a_test
+test/*.out
+test/*.log
+
+# WIP / deprecated test client (dynamic 3A pipewire client; needs cleanup
+# before it can be a clean example). Excluded from the initial release.
+dyn3a_test.c
+
+# WirePlumber local test runtime (wptest/)
+wptest/
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
+
+# Installed backups
+*.bak*
+*.bak-*
