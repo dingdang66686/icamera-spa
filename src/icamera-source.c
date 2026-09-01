@@ -18,6 +18,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,6 +153,13 @@ struct impl {
 	/* Configurable 3A parameters (parsed from node properties in init,
 	 * applied to the HAL backend at start). */
 	struct camhal_3a_settings s3a;
+
+	/* Current target framerate used in EnumFormat/Format negotiation.
+	 * Derived from s3a.frame_rate (fps) once the 3A properties are parsed
+	 * in init, and updated live when the 3A frame-rate prop is changed at
+	 * runtime (so the negotiated framerate tracks the HAL's target fps
+	 * instead of being hardcoded to 30). */
+	struct spa_fraction out_framerate;
 
 	bool active;
 
@@ -499,6 +507,39 @@ static int camhal_stop(struct impl *impl)
 /* spa_node_methods                                                   */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Convert a target frame rate in fps (float) to a struct spa_fraction,
+ * snapping to the nearest common integer/fractional CRT frame rate.
+ * fps <= 0 means "use the HAL default" and falls back to 30/1.
+ *   e.g. 30.0 -> {30,1}  60.0 -> {60,1}  25.0 -> {25,1}
+ *        29.97 -> {30000,1001}  59.94 -> {60000,1001}  23.976 -> {24000,1001}
+ */
+static void icamera_fps_to_fraction(float fps, struct spa_fraction *frac)
+{
+	if (fps <= 0.0f) {
+		frac->num = 30;
+		frac->denom = 1;
+		return;
+	}
+	/* Common fractional (drop-frame-ish) NTSC rates. */
+	if (fps > 29.9f && fps < 30.1f) { frac->num = 30000; frac->denom = 1001; return; }
+	if (fps > 59.8f && fps < 60.2f) { frac->num = 60000; frac->denom = 1001; return; }
+	if (fps > 23.9f && fps < 24.1f) { frac->num = 24000; frac->denom = 1001; return; }
+	if (fps > 49.8f && fps < 50.2f) { frac->num = 50;    frac->denom = 1;    return; }
+	/* Otherwise snap to the nearest integer fps. */
+	long n = (long)lrintf((double)fps);
+	if (n < 1)
+		n = 1;
+	frac->num = (uint32_t)n;
+	frac->denom = 1;
+}
+
+/* Recompute the negotiated output framerate from impl->s3a.frame_rate. */
+static void icamera_update_framerate(struct impl *impl)
+{
+	icamera_fps_to_fraction(impl->s3a.frame_rate, &impl->out_framerate);
+}
+
 /* Build one NV12 EnumFormat pod for the given resolution index.
  * Returns 0 on success, <0 on error. */
 static int build_enum_format(struct impl *impl, struct spa_pod_builder *b,
@@ -517,8 +558,8 @@ static int build_enum_format(struct impl *impl, struct spa_pod_builder *b,
 			&SPA_RECTANGLE(impl->res[idx].width, impl->res[idx].height),
 			&SPA_RECTANGLE(impl->res[idx].width, impl->res[idx].height)),
 		SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-			&SPA_FRACTION(30, 1), &SPA_FRACTION(30, 1),
-			&SPA_FRACTION(30, 1)));
+			&impl->out_framerate, &impl->out_framerate,
+			&impl->out_framerate));
 	return 0;
 }
 
@@ -605,7 +646,7 @@ next:
 			memset(&ri, 0, sizeof(ri));
 			ri.format = SPA_VIDEO_FORMAT_NV12;
 			ri.size = SPA_RECTANGLE(impl->out_port.width, impl->out_port.height);
-			ri.framerate = SPA_FRACTION(30, 1);
+			ri.framerate = impl->out_framerate;
 			param = spa_format_video_raw_build(&b, id, &ri);
 		}
 		break;
@@ -704,6 +745,9 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 				   SPA_POD_TYPE(p) == SPA_TYPE_Float) {
 				impl->s3a.frame_rate =
 					SPA_POD_VALUE(struct spa_pod_float, p);
+				/* Track the negotiated framerate so EnumFormat/Format
+				 * advertise the new target instead of a stale value. */
+				icamera_update_framerate(impl);
 				changed = 1;
 			} else if (strcmp(key, "api.icamera.3a-cadence") == 0 &&
 				   SPA_POD_TYPE(p) == SPA_TYPE_Int) {
@@ -857,8 +901,8 @@ next:
 				&SPA_RECTANGLE(impl->res[0].width, impl->res[0].height),
 				&SPA_RECTANGLE(impl->res[0].width, impl->res[0].height)),
 			SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-				&SPA_FRACTION(30, 1), &SPA_FRACTION(30, 1),
-				&SPA_FRACTION(30, 1)));
+				&impl->out_framerate, &impl->out_framerate,
+				&impl->out_framerate));
 		break;
 	case SPA_PARAM_Format:
 		if (!port->have_format)
@@ -870,7 +914,7 @@ next:
 			memset(&ri, 0, sizeof(ri));
 			ri.format = SPA_VIDEO_FORMAT_NV12;
 			ri.size = SPA_RECTANGLE(port->width, port->height);
-			ri.framerate = SPA_FRACTION(30, 1);
+			ri.framerate = impl->out_framerate;
 			param = spa_format_video_raw_build(&b, id, &ri);
 		}
 		break;
@@ -1475,6 +1519,12 @@ static int impl_init(const struct spa_handle_factory *factory,
 		impl->node_description[sizeof(impl->node_description) - 1] = '\0';
 		impl->device_name[sizeof(impl->device_name) - 1] = '\0';
 	}
+
+	/* Derive the negotiated output framerate from the configured target fps
+	 * (falls back to 30fps when icamera.frame-rate is not set).  This makes
+	 * EnumFormat/Format advertise the real target frame rate instead of a
+	 * hardcoded 30, and tracks the 3A frame-rate at runtime. */
+	icamera_update_framerate(impl);
 
 	impl->node.iface = SPA_INTERFACE_INIT(SPA_TYPE_INTERFACE_Node,
 			SPA_VERSION_NODE, &impl_node, impl);

@@ -255,8 +255,11 @@ SPA_DEBUG=4 systemctl --user restart wireplumber
       `tmpbuf` 以 padded `hal_size` 分配并填充完整 HAL 帧。
 - [x] **P0 — 调试日志收敛**: 已把所有 `fprintf(stderr)` 诊断收敛为 `spa_log` 分级
       （info = 生命周期/3A 更新, debug = 帧级高频统计），可通过 `SPA_DEBUG` 过滤。
-- [ ] **P0→P1 — 帧率联动**: `EnumFormat`/`Format` 当前写死 `30fps`, 未与 3A
-      `frame-rate` / HAL 实际 fps 联动。
+- [x] **P0→P1 — 帧率联动**: `EnumFormat`/`Format` 不再写死 `30fps`。节点根据 3A
+      `frame-rate`（`icamera.frame-rate` 属性，fps float）推导出协商用的帧率并
+      贯通到节点级与端口级的 `EnumFormat`/`Format`；运行时通过
+      `api.icamera.frame-rate` 动态修改时同步更新。未设置时回退 30fps；并支持
+      NTSC 分频（29.97→30000/1001、59.94→60000/1001、23.976→24000/1001）。
 - [ ] **P1 — 多种像素格式**: 目前仅 NV12。支持 BGRx 等格式 / 转换, 以便 RGB-IR
       交叉验证。
 - [ ] **P1 — 时钟/时序对齐**: `SPA_NODE_FLAG_RT` 但采集线程非 RT 线程, 无自定义
