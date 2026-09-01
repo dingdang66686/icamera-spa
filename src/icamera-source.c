@@ -25,7 +25,14 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <time.h>
+
+#if ENABLE_DMA_BUF
+#include <linux/dma-buf.h>
+#include <libdrm/intel_bufmgr.h>
+#endif
 
 #include <spa/utils/defs.h>
 #include <spa/utils/result.h>
@@ -58,6 +65,20 @@
 #include "camhal_backend.h"
 
 #define MAX_BUFFERS 32
+
+/*
+ * R-B dma-mode compile-time switch.
+ *
+ * ENABLE_DMA_BUF defaults to ON.  Set it to 0 (via the Makefile
+ * "-DENABLE_DMA_BUF=0") to compile out the whole DMA-BUF path: the i915 GEM
+ * allocator (libdrm_intel), the SPA_DATA_DmaBuf advertisement, and the
+ * camhal_backend_configure_dmabuf call all disappear, and the plugin always
+ * negotiates plain MemFd (R-A direct / copy paths only).  This lets the plugin
+ * be built without libdrm_intel.
+ */
+#ifndef ENABLE_DMA_BUF
+#define ENABLE_DMA_BUF 1
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Logging helpers                                                     */
@@ -103,6 +124,17 @@ struct port {
 	size_t data_size;	/* packed output size = width * height * 3/2 */
 	size_t hal_size;	/* padded HAL frame size = stride * height * 3/2 */
 	bool have_format;
+
+	/* R-B dma-mode: when the peer negotiates SPA_DATA_DmaBuf we back the
+	 * output buffers with real i915 GEM DMA-BUFs and hand those FDs to the
+	 * HAL via camhal_backend_configure_dmabuf (V4L2_MEMORY_DMABUF), so the
+	 * sensor writes straight into the consumer's DMA-BUF with no memcpy.
+	 * dma_buf = negotiated; dri_fd / bufmgr stay open while we own them. */
+#if ENABLE_DMA_BUF
+	bool dma_buf;
+	int dri_fd;		/* -1 when not in dma-mode */
+	drm_intel_bufmgr *bufmgr;	/* NULL when not in dma-mode */
+#endif
 
 	uint32_t n_buffers;
 	uint32_t capture_next;	/* round-robin cursor for the capture thread */
@@ -204,6 +236,50 @@ struct impl {
 /* ------------------------------------------------------------------ */
 /* libcamhal capture thread (producer)                                */
 /* ------------------------------------------------------------------ */
+
+#if ENABLE_DMA_BUF
+/*
+ * R-B dma-mode cache coherency.  When the HAL DMA-writes a frame into an i915
+ * GEM DMA-BUF (V4L2_MEMORY_DMABUF), and a CPU-only consumer (filesink, python
+ * reader, ...) reads it through our mmap, we must invalidate the CPU cache so
+ * it sees the freshly-DMA'd data and not a stale line.  DMA_BUF_IOCTL_SYNC
+ * with SYNC_START|SYNC_READ before handing the frame downstream does exactly
+ * that (mirrors the standalone test-hal-dmabuf path).
+ */
+static void icamera_dmabuf_sync_read(int fd)
+{
+	if (fd < 0)
+		return;
+	struct dma_buf_sync sync = { 0 };
+	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+	ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+	/* SYNC_END is issued at the start of the next frame (or at teardown);
+	 * a single SYNC_READ_START is enough to flush the CPU cache line. */
+}
+
+/*
+ * Flush any dirty CPU cache out to the DMA-BUF before the HAL reads it via
+ * DMA -- not needed for our read-only consumer flow, but kept for symmetry /
+ * safety so a consumer that mmap'd and wrote the buffer (e.g. a GPU upload in
+ * place) is visible to the HAL on requeue.
+ */
+static void icamera_dmabuf_begin_cpu_write(int fd)
+{
+	if (fd < 0)
+		return;
+	struct dma_buf_sync sync = { 0 };
+	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE;
+	ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+static void icamera_dmabuf_end_cpu_write(int fd)
+{
+	if (fd < 0)
+		return;
+	struct dma_buf_sync sync = { 0 };
+	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+	ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+#endif /* ENABLE_DMA_BUF */
 
 static void *capture_thread_main(void *data)
 {
@@ -357,6 +433,15 @@ static void *capture_thread_main(void *data)
 				} else if (dst != NULL) {
 					memcpy(dst, impl->tmpbuf, copy);
 				}
+				/* R-B dma-mode (fallback when HAL dmabuf configure
+				 * failed): we filled the DMA-BUF with a CPU memcpy, so
+				 * flush it so a GPU consumer binding the fd sees it. */
+#if ENABLE_DMA_BUF
+				if (impl->out_port.dma_buf) {
+					icamera_dmabuf_begin_cpu_write(d->fd);
+					icamera_dmabuf_end_cpu_write(d->fd);
+				}
+#endif
 				d->chunk->size = (uint32_t)copy;
 				/* Tag the frame with its presentation time on the
 				 * monotonic clock.  The downstream video sink syncs to
@@ -438,6 +523,13 @@ static void *capture_thread_main_direct(void *data)
 
 		struct frame *frame = &impl->out_port.buffers[idx];
 
+#if ENABLE_DMA_BUF
+		/* R-B dma-mode: invalidate the CPU cache for the (mmap'd)
+		 * DMA-BUF so a CPU consumer sees the HAL's fresh DMA write. */
+		if (impl->out_port.dma_buf)
+			icamera_dmabuf_sync_read(frame->outbuf->datas[0].fd);
+#endif
+
 		/* Present the frame.  Set its pts on the monotonic clock for the
 		 * sink, mark it filled/outstanding, and queue it for process(). */
 		{
@@ -515,14 +607,67 @@ static int camhal_start(struct impl *impl)
 
 	int stride = 0, size = 0;
 
-	/*
-	 * R-A direct / zero-copy: try to make the SPA output buffers double as
-	 * the HAL's USERPTR buffers.  This only works when the HAL does not pad
-	 * lines (stride == width); camhal_backend_configure_external returns
-	 * -EINVAL otherwise and we fall through to the copying path.
-	 */
 	impl->zero_copy = false;
-	if (impl->out_port.n_buffers > 0) {
+#if ENABLE_DMA_BUF
+	/*
+	 * R-B dma-mode: if the peer negotiated SPA_DATA_DmaBuf our output
+	 * buffers are i915 GEM DMA-BUFs (allocated by icamera_alloc_buffers)
+	 * whose fds can be imported directly by the HAL via
+	 * camhal_backend_configure_dmabuf (V4L2_MEMORY_DMABUF).  That is the
+	 * mirror of official icamerasrc dma_mode: the sensor DMA-writes the
+	 * frame straight into the consumer's buffer -- no per-frame memcpy.
+	 *
+	 * This takes priority over R-A because it is the true hardware
+	 * zero-copy path.  On any failure we fall back to R-A direct (memfd)
+	 * and then to the copying path, so non-DMA setups always still work
+	 * (auto-fallback).
+	 */
+	if (impl->out_port.n_buffers > 0 && impl->out_port.dma_buf) {
+		int fds[MAX_BUFFERS];
+		int i;
+		bool all_fd = true;
+		for (i = 0; i < (int)impl->out_port.n_buffers; i++) {
+			struct frame *f = &impl->out_port.buffers[i];
+			if (!f->outbuf || f->outbuf->n_datas < 1 ||
+			    f->outbuf->datas[0].fd < 0) {
+				all_fd = false;
+				break;
+			}
+			fds[i] = f->outbuf->datas[0].fd;
+		}
+		if (all_fd &&
+		    camhal_backend_configure_dmabuf(impl->backend,
+						     impl->out_port.width,
+						     impl->out_port.height,
+						     impl->out_port.n_buffers,
+						     fds, &stride, &size) == 0) {
+			impl->zero_copy = true;
+			impl->out_port.stride = (uint32_t)stride;
+			impl->out_port.hal_size = impl->out_port.data_size;
+			ICAM_LOG_INFO(impl,
+				"icamera: DMA-BUF zero-copy %ux%u nbuf=%u (HAL imports "
+				"i915 GEM fds and writes straight into peer buffers)",
+				impl->out_port.width, impl->out_port.height,
+				impl->out_port.n_buffers);
+		} else {
+			/* Peer wanted DMA-BUFs but the HAL path failed (e.g.
+			 * padded stride).  We still have the buffers mmap'd for
+			 * CPU access, so fall back to the memfd-style copy path
+			 * below. */
+			if (impl->log)
+				spa_log_error(impl->log,
+					"icamera: dmabuf configure failed, falling back");
+		}
+	}
+#endif /* ENABLE_DMA_BUF */
+
+	if (!impl->zero_copy && impl->out_port.n_buffers > 0) {
+		/*
+		 * R-A direct / zero-copy: try to make the SPA output buffers double as
+		 * the HAL's USERPTR buffers.  This only works when the HAL does not pad
+		 * lines (stride == width); camhal_backend_configure_external returns
+		 * -EINVAL otherwise and we fall through to the copying path.
+		 */
 		void *addrs[MAX_BUFFERS];
 		int i;
 		bool all_map = true;
@@ -1097,7 +1242,19 @@ next:
 			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(2, 4, MAX_BUFFERS),
 			SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
 			SPA_PARAM_BUFFERS_size,    SPA_POD_Int(port->data_size),
-			SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(port->width));
+			SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(port->width),
+			/* R-B: we can back the output with either a plain memfd or a
+			 * real DMA-BUF (i915 GEM).  Advertising both lets PipeWire pick
+			 * DmaBuf for DMA-capable consumers (true hardware zero-copy
+			 * into their buffers) while still allowing memfd for everyone
+			 * else (R-A direct / copy fallback). */
+#if ENABLE_DMA_BUF
+			SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(
+				(1u << SPA_DATA_MemFd) | (1u << SPA_DATA_DmaBuf)));
+#else
+			SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(
+				(1u << SPA_DATA_MemFd)));
+#endif
 		break;
 	default:
 		return -ENOENT;
@@ -1183,30 +1340,83 @@ static int icamera_clear_buffers(struct impl *impl, struct port *port)
 		frame->outbuf = NULL;
 	}
 	port->n_buffers = 0;
+#if ENABLE_DMA_BUF
+	port->dma_buf = false;
+	/* Release the i915 bufmgr / render node we held while in dma-mode. */
+	if (port->bufmgr) {
+		drm_intel_bufmgr_destroy(port->bufmgr);
+		port->bufmgr = NULL;
+	}
+	if (port->dri_fd >= 0) {
+		close(port->dri_fd);
+		port->dri_fd = -1;
+	}
+#endif
 	spa_list_init(&port->queue);
 	return 0;
 }
 
 /*
- * Allocate the output buffers ourselves as cross-process shared memfd,
- * following the same scheme as the v4l2 and libcamera SPA plugins when the
- * peer sets SPA_NODE_BUFFERS_FLAG_ALLOC on use_buffers().
+ * Allocate the output buffers ourselves when the peer sets
+ * SPA_NODE_BUFFERS_FLAG_ALLOC on use_buffers() (the v4l2 / libcamera SPA
+ * plugin scheme).  The peer has already arranged each spa_buffer->datas[]
+ * with the *negotiated* data type:
  *
- * The peer has already arranged each spa_buffer->datas[] with the desired
- * data type (SPA_DATA_MemFd / SPA_DATA_DmaBuf); we back it with a fresh
- * memfd so every process in the graph sees the same writable memory and
- * so writing a full frame can never overrun the buffer.
+ *   - SPA_DATA_DmaBuf -> R-B dma-mode: allocate real i915 GEM DMA-BUFs via
+ *     libdrm_intel on /dev/dri/renderD128 (identical to the official
+ *     icamerasrc dma_mode pool: drm_intel_bo_alloc + gem_export_to_prime).
+ *     The fd is handed to the HAL (camhal_backend_configure_dmabuf) who
+ *     imports it as V4L2_MEMORY_DMABUF and writes the sensor frame straight
+ *     into the consumer's buffer -> true hardware zero-copy.  We ALSO mmap
+ *     the buffer so CPU-only consumers (filesink etc.) still work.
+ *
+ *   - SPA_DATA_MemFd -> default: allocate a cross-process memfd (R-A / copy).
+ *
+ * Every buffer is BUFFER_FLAG_OWNED so icamera_clear_buffers() un-maps and
+ * closes whatever we allocated (memfd or DMA-BUF fd).
  */
 static int icamera_alloc_buffers(struct impl *impl, struct port *port,
 				 struct spa_buffer **buffers, uint32_t n_buffers)
 {
 	uint32_t i;
+	bool dmabuf = false;
+	int initial_type = SPA_ID_INVALID;
+
+#if ENABLE_DMA_BUF
+	/* Base the allocator choice on the negotiated data type of the first
+	 * data block.  The peer (via use_buffers) either filled in a concrete
+	 * type or left it invalid for us to choose. */
+	if (n_buffers > 0 && buffers[0]->n_datas >= 1) {
+		initial_type = buffers[0]->datas[0].type;
+		dmabuf = (initial_type == SPA_DATA_DmaBuf);
+	}
+
+	if (dmabuf) {
+		/* Keep the render-node + bufmgr for the whole batch. */
+		port->dri_fd = open("/dev/dri/renderD128", O_RDWR);
+		if (port->dri_fd < 0) {
+			spa_log_error(impl->log, "icamera: open renderD128: %m");
+			return -errno;
+		}
+		port->bufmgr = drm_intel_bufmgr_gem_init(port->dri_fd, 4096);
+		if (!port->bufmgr) {
+			spa_log_error(impl->log, "icamera: bufmgr_gem_init failed");
+			close(port->dri_fd);
+			port->dri_fd = -1;
+			return -EIO;
+		}
+		ICAM_LOG_INFO(impl, "icamera: dma-mode: allocating %u i915 GEM DMA-BUFs",
+			      n_buffers);
+	}
+#else
+	(void)initial_type;
+#endif
 
 	for (i = 0; i < n_buffers; i++) {
 		struct frame *frame = &port->buffers[i];
 		struct spa_data *d;
 		int fd = -1;
-		void *ptr;
+		void *ptr = NULL;
 
 		if (buffers[i]->n_datas < 1) {
 			spa_log_error(impl->log, "icamera: buffer %u has no datas", i);
@@ -1214,30 +1424,69 @@ static int icamera_alloc_buffers(struct impl *impl, struct port *port,
 		}
 		d = &buffers[i]->datas[0];
 
-		fd = memfd_create("icamera-buf", MFD_CLOEXEC);
-		if (fd < 0) {
-			spa_log_error(impl->log, "icamera: memfd_create: %m");
-			return -errno;
-		}
-		if (ftruncate(fd, (off_t)port->data_size) < 0) {
-			spa_log_error(impl->log, "icamera: ftruncate: %m");
-			close(fd);
-			return -errno;
-		}
-		ptr = mmap(NULL, port->data_size, PROT_READ | PROT_WRITE,
-			   MAP_SHARED, fd, 0);
-		if (ptr == MAP_FAILED) {
-			spa_log_error(impl->log, "icamera: mmap: %m");
-			close(fd);
-			return -errno;
-		}
+#if ENABLE_DMA_BUF
+		if (dmabuf) {
+			drm_intel_bo *bo;
+			/* Match icamerasrc: page-aligned, driver-aligned size.
+			 * GEM export hands us the prime fd; DRM owns the BO
+			 * lifetime (unreference after export, fd still valid). */
+			uint32_t bufsize = (uint32_t)port->data_size;
+			if (bufsize & 4095u)
+				bufsize = (bufsize + 4095u) & ~4095u;
+			bo = drm_intel_bo_alloc(port->bufmgr, "icamera-dma",
+						bufsize, 4096);
+			if (bo == NULL) {
+				spa_log_error(impl->log, "icamera: bo_alloc[%u] failed", i);
+				return -ENOMEM;
+			}
+			if (drm_intel_bo_gem_export_to_prime(bo, &fd) < 0) {
+				drm_intel_bo_unreference(bo);
+				spa_log_error(impl->log, "icamera: gem_export_to_prime[%u]: %m", i);
+				return -errno;
+			}
+			drm_intel_bo_unreference(bo);
+			ptr = mmap(NULL, bufsize, PROT_READ | PROT_WRITE,
+				   MAP_SHARED, fd, 0);
+			if (ptr == MAP_FAILED) {
+				spa_log_error(impl->log, "icamera: mmap dmabuf[%u]: %m", i);
+				close(fd);
+				return -errno;
+			}
 
-		d->type = SPA_DATA_MemFd;
-		d->flags = SPA_DATA_FLAG_READABLE | SPA_DATA_FLAG_MAPPABLE;
-		d->fd = fd;
-		d->mapoffset = 0;
-		d->data = ptr;
-		d->maxsize = (uint32_t)port->data_size;
+			d->type = SPA_DATA_DmaBuf;
+			d->flags = SPA_DATA_FLAG_READABLE | SPA_DATA_FLAG_MAPPABLE;
+			d->fd = fd;
+			d->mapoffset = 0;
+			d->data = ptr;
+			d->maxsize = bufsize;
+		} else
+#endif
+		{
+			fd = memfd_create("icamera-buf", MFD_CLOEXEC);
+			if (fd < 0) {
+				spa_log_error(impl->log, "icamera: memfd_create: %m");
+				return -errno;
+			}
+			if (ftruncate(fd, (off_t)port->data_size) < 0) {
+				spa_log_error(impl->log, "icamera: ftruncate: %m");
+				close(fd);
+				return -errno;
+			}
+			ptr = mmap(NULL, port->data_size, PROT_READ | PROT_WRITE,
+				   MAP_SHARED, fd, 0);
+			if (ptr == MAP_FAILED) {
+				spa_log_error(impl->log, "icamera: mmap: %m");
+				close(fd);
+				return -errno;
+			}
+
+			d->type = SPA_DATA_MemFd;
+			d->flags = SPA_DATA_FLAG_READABLE | SPA_DATA_FLAG_MAPPABLE;
+			d->fd = fd;
+			d->mapoffset = 0;
+			d->data = ptr;
+			d->maxsize = (uint32_t)port->data_size;
+		}
 		if (d->chunk) {
 			d->chunk->offset = 0;
 			d->chunk->size = 0;
@@ -1259,6 +1508,11 @@ static int icamera_alloc_buffers(struct impl *impl, struct port *port,
 	}
 
 	port->n_buffers = n_buffers;
+#if ENABLE_DMA_BUF
+	port->dma_buf = dmabuf;
+#else
+	(void)dmabuf;
+#endif
 	spa_list_init(&port->queue);
 	return 0;
 }
@@ -1767,6 +2021,11 @@ static int impl_init(const struct spa_handle_factory *factory,
 	impl->out_port.io = NULL;
 	impl->out_port.control = NULL;
 	impl->out_port.control_size = 0;
+#if ENABLE_DMA_BUF
+	impl->out_port.dma_buf = false;
+	impl->out_port.dri_fd = -1;
+	impl->out_port.bufmgr = NULL;
+#endif
 	pthread_mutex_init(&impl->out_port.queue_lock, NULL);
 	spa_list_init(&impl->out_port.queue);
 

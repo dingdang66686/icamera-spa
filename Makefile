@@ -19,6 +19,25 @@ CFLAGS  += -O2 -g -fPIC -Wall -Wextra $(SPA_INCDIR) -Isrc
 CXXFLAGS += -O2 -g -fPIC -Wall -Wextra $(SPA_INCDIR) -Isrc
 LDLIBS   += -lcamhal -lpthread
 
+# R-B dma-mode compile-time switch (default ON).
+#
+#   make                      -> ENABLE_DMA_BUF=1, links libdrm_intel/libdrm
+#   make ENABLE_DMA_BUF=0     -> compiles out the whole DMA-BUF path and does
+#                                NOT link libdrm_intel/libdrm (plugin only ever
+#                                advertises/uses MemFd)
+#
+# src/icamera-source.c and src/camhal_backend.* default ENABLE_DMA_BUF to 1 if
+# unspecified; we set it explicitly here so the linkage matches the code.
+ENABLE_DMA_BUF ?= 1
+ifeq ($(ENABLE_DMA_BUF),0)
+CFLAGS  += -DENABLE_DMA_BUF=0
+CXXFLAGS += -DENABLE_DMA_BUF=0
+else
+CFLAGS  += -DENABLE_DMA_BUF=1
+CXXFLAGS += -DENABLE_DMA_BUF=1
+LDLIBS  += -ldrm_intel -ldrm
+endif
+
 OBJ := build/icamera-source.o build/camhal_backend.o
 SO  := build/libspa-icamera.so
 
@@ -58,8 +77,33 @@ build/test-hal-release: test/test-hal-release.cpp build/camhal_backend.o
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -std=c++11 -o $@ test/test-hal-release.cpp build/camhal_backend.o -lcamhal -lpthread
 
-.PHONY: clean install install-monitor test-hal-release
+# Standalone R-B "dma-mode" test: allocate real i915 GEM DMA-BUFs, configure
+# the backend with camhal_backend_configure_dmabuf() (V4L2_MEMORY_DMABUF import),
+# stream via dqbuf_index/release and confirm the HAL writes live content into
+# our buffers.  Triggers on libdrm_intel for /dev/dri/renderD128 GEM export.
+build/test-hal-dmabuf: test/test-hal-dmabuf.cpp build/camhal_backend.o
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -std=c++11 -o $@ test/test-hal-dmabuf.cpp build/camhal_backend.o -lcamhal -lpthread -ldrm_intel -ldrm
+
+.PHONY: clean install install-monitor test-hal-release test-hal-dmabuf \
+	test-pw-dmabuf-direct test-pw-dmabuf-consumer
 test-hal-release: build/test-hal-release
+test-hal-dmabuf: build/test-hal-dmabuf
+
+# End-to-end R-B dma-mode proof: a minimal direct SPA driver that dlopens the
+# installed libspa-icamera.so and forces DmaBuf allocation
+# (SPA_DATA_DmaBuf + SPA_NODE_BUFFERS_FLAG_ALLOC), then Start + process loop.
+build/test-pw-dmabuf-direct: test/test-pw-dmabuf-direct.c
+	@mkdir -p build
+	$(CC) -O2 -g -Wall -Wextra -o $@ $< $(SPA_INCDIR)
+
+# pw_stream-based DmaBuf consumer (negotiates MemFd only; kept for reference).
+build/test-pw-dmabuf-consumer: test/test-pw-dmabuf-consumer.c
+	@mkdir -p build
+	$(CC) -O2 -g -Wall -Wextra -o $@ $< $(SPA_INCDIR)
+
+test-pw-dmabuf-direct: build/test-pw-dmabuf-direct
+test-pw-dmabuf-consumer: build/test-pw-dmabuf-consumer
 clean:
 	rm -rf build
 

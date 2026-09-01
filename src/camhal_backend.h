@@ -197,6 +197,50 @@ int camhal_backend_dqbuf_index(struct camhal_backend *b,
 int camhal_backend_release(struct camhal_backend *b, int index);
 
 /*
+ * R-B dma-mode (compile-time opt-in).
+ *
+ * ENABLE_DMA_BUF defaults to ON (see below).  When set to 0 the whole
+ * configure_dmabuf() API and the V4L2_MEMORY_DMABUF import path are compiled
+ * out, so the plugin can be built without libdrm_intel.  The Makefile sets
+ * "-DENABLE_DMA_BUF=0" to disable (and drops -ldrm_intel -ldrm from LDLIBS).
+ */
+#ifndef ENABLE_DMA_BUF
+#define ENABLE_DMA_BUF 1
+#endif
+
+#if ENABLE_DMA_BUF
+/*
+ * Direct / zero-copy mode via DMA-BUF (R-B, dma-mode): register caller-owned
+ * DMA-BUF (exported PRIME/GEM) fds as the HAL's V4L2_MEMORY_DMABUF buffers
+ * instead of USERPTR user addresses.  The sensor / PSYS writes frames straight
+ * into these hardware buffers (imported via dma_buf_get()), so downstream can
+ * consume the same DMA-BUF without a CPU copy.
+ *
+ * As with configure_external this is ONLY valid when the HAL's bytes-per-line
+ * equals the nominal width (no per-line padding); otherwise the packed NV12
+ * layout does not match what the HAL would produce and we return -EINVAL so the
+ * caller can fall back to the copying path.
+ *
+ *   fds      - array of n_buffers DMA-BUF fds (caller-owned; the backend does
+ *              NOT close them).  Each fd must be a real DMA-BUF that the HAL's
+ *              V4L2 layer can dma_buf_get() (a plain memfd will be rejected).
+ *   out_stride/out_size - as in camhal_backend_configure (HAL stride/size).
+ *
+ * After a successful configure_dmabuf the caller drives capture exactly like
+ * the external (R-A) path with camhal_backend_dqbuf_index() /
+ * camhal_backend_release(); buffers are NOT auto-requeued.
+ *
+ * Returns 0 on success, -EINVAL when the layout would need padding, or a
+ * negative errno.
+ */
+int camhal_backend_configure_dmabuf(struct camhal_backend *b,
+				    int width, int height,
+				    int n_buffers,
+				    int *fds,
+				    int *out_stride, int *out_size);
+#endif /* ENABLE_DMA_BUF */
+
+/*
  * Stop (camera_device_stop) and release resources (close + deinit).
  */
 int camhal_backend_stop(struct camhal_backend *b);

@@ -184,6 +184,10 @@ void camhal_free_cameras(struct camhal_camera_info *cams, int count)
 	 * the automatic inflight window. */
 	int      external;            /* 1 = direct mode (caller-owned buffers) */
 	void   **external_addrs;      /* caller-provided region pointers (owned by caller) */
+#if ENABLE_DMA_BUF
+	int      dma_mode;            /* 1 = R-B DMA-BUF mode (caller-provided dma-buf fds) */
+	int     *external_fds;        /* caller-provided DMA-BUF fds (owned by caller) */
+#endif
 	int     *external_out;        /* per-slot: 1 = currently dequeued, not yet released */
 	int      external_head;       /* oldest not-yet-released, for in-order release */
 
@@ -527,6 +531,124 @@ err:
 	}
 	return -ENOMEM;
 }
+
+/*
+ * Create the V4L2_MEMORY_DMABUF camera_buffer_t array backing a stream (R-B /
+ * dma-mode).  The caller owns the DMA-BUF fds (typically exported i915 GEM
+ * buffers used as the SPA output buffers); we wrap each in a camera_buffer_t
+ * carrying that dmafd so camera_stream_qbuf() imports it via dma_buf_get() and
+ * the sensor / PSYS writes the frame straight into the hardware buffer.
+ *
+ * The HAL must have no line padding (stride == width) for the packed-NV12
+ * output layout to match; the caller checks that before calling.
+ *
+ * Like the USERPTR external path, this sets b->external so the shared
+ * dqbuf_index()/release()/stop() index-based tracking applies (those functions
+ * only touch ->buffers[index] and ->external_out, never ->addr, so they work
+ * unchanged for DMABUF).  The dma fds remain owned by the caller.
+ *
+ * On entry the stream (config_streams) has been applied and b->stream_stride /
+ * b->stream_size are set.  Returns 0 on success, negative errno otherwise.
+ */
+#if ENABLE_DMA_BUF
+static int setup_dmabuf_buffers(struct camhal_backend *b,
+				const stream_t &stream, int n_buffers,
+				int *fds, int buf_size)
+{
+	int i;
+
+	if (!fds)
+		return -EINVAL;
+
+	/* The HAL reports the (conservative, slack-inflated) stream.size; what it
+	 * actually writes with stride==width is stride*height*3/2.  Many GEM /
+	 * PRIME buffers are sized to the packed frame (or aligned larger), so
+	 * require at least the real written size. */
+	{
+		size_t need = (size_t)b->stream_stride * b->stream_height * 3 / 2;
+		if ((size_t)buf_size < need) {
+			CAM_LOG_ERR(b, "camhal: dma buffer size %d < need %zu "
+				    "(stride=%d h=%d)", buf_size, need,
+				    b->stream_stride, b->stream_height);
+			return -EINVAL;
+		}
+	}
+
+	b->buffers = (camera_buffer_t **)calloc(n_buffers,
+						sizeof(camera_buffer_t *));
+	if (!b->buffers)
+		return -ENOMEM;
+
+	for (i = 0; i < n_buffers; i++) {
+		camera_buffer_t *buf =
+			(camera_buffer_t *)calloc(1, sizeof(camera_buffer_t));
+		if (!buf)
+			goto err;
+		buf->s = stream;
+		buf->s.memType = V4L2_MEMORY_DMABUF;
+		buf->s.size = (uint32_t)buf_size;
+		buf->dmafd = fds[i];
+		buf->flags = BUFFER_FLAG_DMA_EXPORT;
+		buf->index = i;
+		b->buffers[i] = buf;
+		CAM_LOG_DEBUG(b, "camhal: dmabuf buffer %d dmafd=%d size=%d",
+			      i, fds[i], buf_size);
+	}
+
+	/* Mark direct mode (shares the index-based dqbuf_index/release/stop
+	 * tracking with the USERPTR external path). */
+	b->dma_mode = 1;
+	b->external = 1;
+	b->external_fds = fds;
+	b->external_out = (int *)calloc(n_buffers, sizeof(int));
+	b->external_head = 0;
+	if (!b->external_out) {
+		b->dma_mode = 0;
+		b->external = 0;
+		b->external_fds = NULL;
+		goto err_free_buffers;
+	}
+
+	/* Queue each DMABUF buffer to the HAL, num_buffers=1 per buffer (the
+	 * correct single-stream usage; passing n_buffers corrupts the mapping). */
+	for (i = 0; i < n_buffers; i++) {
+		camera_buffer_t *one = b->buffers[i];
+		one->sequence = -1;
+		one->timestamp = 0;
+		if (camera_stream_qbuf(b->camera_id, &one, 1, NULL) < 0) {
+			for (int j = 0; j < n_buffers; j++) {
+				if (b->buffers[j])
+					free(b->buffers[j]);
+			}
+			free(b->buffers);
+			b->buffers = NULL;
+			if (b->external_out) {
+				free(b->external_out);
+				b->external_out = NULL;
+			}
+			b->dma_mode = 0;
+			b->external = 0;
+			b->external_fds = NULL;
+			return -EIO;
+		}
+	}
+	return 0;
+
+err:
+	for (int j = 0; j < i; j++) {
+		if (b->buffers[j])
+			free(b->buffers[j]);
+	}
+err_free_buffers:
+	free(b->buffers);
+	b->buffers = NULL;
+	if (b->external_out) {
+		free(b->external_out);
+		b->external_out = NULL;
+	}
+	return -ENOMEM;
+}
+#endif /* ENABLE_DMA_BUF */
 
 int camhal_backend_configure(struct camhal_backend *b,
 			     int width, int height,
@@ -886,6 +1008,109 @@ int camhal_backend_configure_external(struct camhal_backend *b,
 		*out_size = b->stream_size;
 	return 0;
 }
+
+#if ENABLE_DMA_BUF
+int camhal_backend_configure_dmabuf(struct camhal_backend *b,
+				    int width, int height,
+				    int n_buffers,
+				    int *fds,
+				    int *out_stride, int *out_size)
+{
+	int ret;
+
+	if (!b || !fds || n_buffers <= 0)
+		return -EINVAL;
+
+	/* Find the full, HAL-known stream description for (NV12, width x height),
+	 * mirroring camhal_backend_configure / _external. */
+	camera_info_t cinfo;
+	memset(&cinfo, 0, sizeof(cinfo));
+	stream_array_t configs;
+	stream_t stream;
+	memset(&stream, 0, sizeof(stream));
+	int found = 0;
+
+	if (get_camera_info(b->camera_id, cinfo) == 0 && cinfo.capability) {
+		configs.clear();
+		cinfo.capability->getSupportedStreamConfig(configs);
+		for (size_t i = 0; i < configs.size(); i++) {
+			if (configs[i].format == V4L2_PIX_FMT_NV12 &&
+			    configs[i].width == (uint32_t)width &&
+			    configs[i].height == (uint32_t)height) {
+				stream = configs[i];
+				found = 1;
+				break;
+			}
+		}
+	}
+	if (!found) {
+		CAM_LOG_WARN(b, "camhal: dma-mode: no supported NV12 %dx%d stream",
+			     width, height);
+		return -EINVAL;
+	}
+	stream.memType = V4L2_MEMORY_DMABUF;
+
+	/* Like R-A external, DMA-BUF passthrough is ONLY safe when the HAL does
+	 * not pad each line (stride == width), so the packed NV12 layout matches
+	 * what the (SPA) buffer holds.  Refuse otherwise and let the caller
+	 * fall back to the copying path. */
+	int stride = stream.stride > 0 ? stream.stride : width;
+	if (stride != width) {
+		CAM_LOG_INFO(b, "camhal: dma-mode declined: stride=%d != width=%d "
+			     "(would need padding) - falling back to copy path",
+			     stride, width);
+		return -EINVAL;
+	}
+
+	stream_config_t config;
+	memset(&config, 0, sizeof(config));
+	config.operation_mode = CAMERA_STREAM_CONFIGURATION_MODE_AUTO;
+	config.num_streams = 1;
+	config.streams = &stream;
+
+	stream_t input_config;
+	memset(&input_config, 0, sizeof(input_config));
+	input_config.format = -1;
+	input_config.width  = 0;
+	input_config.height = 0;
+	camera_device_config_sensor_input(b->camera_id, &input_config);
+
+	if (camera_device_config_streams(b->camera_id, &config) < 0)
+		return -EIO;
+
+	CAM_LOG_INFO(b, "camhal: dma-mode config_streams OK id=%d format=0x%x "
+		     "%dx%d stride=%d size=%d", stream.id, stream.format,
+		     stream.width, stream.height, stream.stride, stream.size);
+
+	b->stream_id = stream.id;
+	b->stream_width = width;
+	b->stream_height = height;
+	b->stream_size = stream.size > 0 ? (int)stream.size
+					: (int)((size_t)width * height * 3 / 2);
+	b->stream_stride = stride;
+	b->n_buffers = n_buffers;
+
+	/* DMA-BUF buffers have no CPU address; use a page-aligned frame size as
+	 * the per-buffer size the HAL validation expects. */
+	int bufsz = (int)b->stream_size;
+	if (bufsz & (getpagesize() - 1))
+		bufsz = (bufsz + getpagesize() - 1) & ~(getpagesize() - 1);
+
+	CAM_LOG_INFO(b, "camhal: dma-mode active: HAL stride==width (%d), "
+		     "zero-copy via caller DMA-BUF import", stride);
+
+	/* Register the caller's DMA-BUF fds as the DMABUF array. */
+	ret = setup_dmabuf_buffers(b, stream, n_buffers, fds, bufsz);
+	if (ret != 0)
+		return ret;
+
+	if (out_stride)
+		*out_stride = b->stream_stride;
+	if (out_size)
+		*out_size = b->stream_size;
+	return 0;
+}
+#endif /* ENABLE_DMA_BUF */
 
 int camhal_backend_dqbuf_index(struct camhal_backend *b,
 			       int *out_index, uint64_t *out_ts)
