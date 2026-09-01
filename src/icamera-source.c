@@ -98,7 +98,9 @@ struct frame {
 
 struct port {
 	uint32_t width, height;
-	size_t data_size;
+	uint32_t stride;	/* HAL bytes-per-line (may be > width for padding) */
+	size_t data_size;	/* packed output size = width * height * 3/2 */
+	size_t hal_size;	/* padded HAL frame size = stride * height * 3/2 */
 	bool have_format;
 
 	uint32_t n_buffers;
@@ -196,7 +198,7 @@ static void *capture_thread_main(void *data)
 		uint64_t ts = 0;
 		int ret = camhal_backend_dqbuf(impl->backend,
 					       impl->tmpbuf,
-					       (int)impl->out_port.data_size,
+					       (int)impl->out_port.hal_size,
 					       &ts);
 		if (ret < 0) {
 			if (impl->log)
@@ -301,12 +303,44 @@ static void *capture_thread_main(void *data)
 			if (frame != NULL) {
 				size_t copy = impl->out_port.data_size;
 				struct spa_data *d = &frame->outbuf->datas[0];
+				void *dst = d->data;
 				/* The buffer handed to us by the peer (gst) may advertise
 				 * maxsize==0; trust our own layout, cap only if peer gives a
 				 * sane non-zero maxsize. */
 				if (d->maxsize > 0 && copy > d->maxsize)
 					copy = d->maxsize;
-				memcpy(d->data, impl->tmpbuf, copy);
+				/* Stride handling (P0): the HAL may pad each NV12 line
+				 * beyond the negotiated width.  tmpbuf holds the padded
+				 * frame; we must copy per-row to strip the padding so the
+				 * output buffer holds a clean packed NV12 frame matching
+				 * SPA_FORMAT_VIDEO_size (otherwise rows shift and the
+				 * picture looks green/misaligned).  When stride == width
+				 * this reduces to a single flat memcpy (fast path). */
+				if (dst != NULL && impl->out_port.stride > impl->out_port.width) {
+					const uint8_t *src = (const uint8_t *)impl->tmpbuf;
+					uint32_t w = impl->out_port.width;
+					uint32_t s = impl->out_port.stride;
+					uint32_t h = impl->out_port.height;
+					uint8_t *out = (uint8_t *)dst;
+					size_t row, rowBytes;
+
+					/* Y plane: h rows of w bytes packed from s-byte rows. */
+					rowBytes = (size_t)w;
+					for (row = 0; row < h; row++) {
+						memcpy(out + row * rowBytes,
+						       src + (size_t)row * s, rowBytes);
+					}
+					/* UV plane (interleaved CbCr): h/2 rows of w bytes. */
+					for (row = 0; row < h / 2; row++) {
+						memcpy(out + (size_t)h * w + row * rowBytes,
+						       src + (size_t)s * h + (size_t)row * s, rowBytes);
+					}
+					copy = (size_t)h * w * 3 / 2;
+					if (d->maxsize > 0 && copy > d->maxsize)
+						copy = d->maxsize;
+				} else if (dst != NULL) {
+					memcpy(dst, impl->tmpbuf, copy);
+				}
 				d->chunk->size = (uint32_t)copy;
 				/* Tag the frame with its presentation time on the
 				 * monotonic clock.  The downstream video sink syncs to
@@ -398,13 +432,27 @@ static int camhal_start(struct impl *impl)
 			spa_log_error(impl->log, "camhal configure failed");
 		return -EIO;
 	}
-	if (size > 0)
-		impl->out_port.data_size = (size_t)size;
+	/* Stride handling (P0): the HAL may pad each line beyond the nominal
+	 * width (e.g. RGB-IR full resolution).  Keep the *packed* size (width*
+	 * height*3/2) as the data_size we negotiate/advertise downstream, but
+	 * remember the HAL's real bytes-per-line so the capture thread can copy
+	 * row-by-row and strip the padding (otherwise frames come out shifted /
+	 * green-striped).  hal_size is the padded frame size the HAL produces,
+	 * which is what tmpbuf must be able to hold. */
+	impl->out_port.stride = (uint32_t)stride;
+	impl->out_port.hal_size = (size_t)((size_t)impl->out_port.stride *
+					   impl->out_port.height * 3 / 2);
+	if (impl->out_port.hal_size < impl->out_port.data_size)
+		impl->out_port.hal_size = impl->out_port.data_size;
 
 	if (impl->tmpbuf == NULL)
-		impl->tmpbuf = malloc(impl->out_port.data_size);
+		impl->tmpbuf = malloc(impl->out_port.hal_size);
 	if (impl->tmpbuf == NULL)
 		return -ENOMEM;
+
+	ICAM_LOG_INFO(impl, "icamera: HAL %ux%u stride=%d packed=%zu hal=%zu",
+		      impl->out_port.width, impl->out_port.height, stride,
+		      impl->out_port.data_size, impl->out_port.hal_size);
 
 	if (camhal_backend_start(impl->backend) < 0) {
 		if (impl->log)

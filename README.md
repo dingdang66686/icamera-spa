@@ -246,10 +246,13 @@ SPA_DEBUG=4 systemctl --user restart wireplumber
 
 当前处于"功能主线已跑通"状态, 仍有以下高优先级项待完善:
 
-- [ ] **P0 — Stride 处理**: 目前 `data_size` 与 buffer stride 按 `width` 估算,
-      未使用 `camhal_backend_configure()` 返回的 HAL 真实 stride。若 HAL 对某些
-      分辨率（如 RGB-IR 全分辨率）加行 padding, 帧会产生错位/绿条。需把 HAL stride
-      贯通到 format/buffers 协商并按 stride 逐行拷贝。
+- [x] **P0 — Stride 处理**: 已把 `camhal_backend_configure()` 返回的 HAL 真实
+      stride 贯通到采集路径。节点记录 HAL 的 bytes-per-line；当 stride 大于协商
+      宽度（如 RGB-IR 全分辨率有行 padding）时，采集线程按 stride **逐行拷贝并剥除
+      padding**，产出干净的 packed NV12 帧（`SPA_FORMAT_VIDEO_size` 一致），
+      消除错位/绿条；stride == width 时退化为单次 flat memcpy 快路径。输出缓冲
+      与 buffers 协商保持 packed（`SPA_PARAM_BUFFERS_stride` = width），
+      `tmpbuf` 以 padded `hal_size` 分配并填充完整 HAL 帧。
 - [x] **P0 — 调试日志收敛**: 已把所有 `fprintf(stderr)` 诊断收敛为 `spa_log` 分级
       （info = 生命周期/3A 更新, debug = 帧级高频统计），可通过 `SPA_DEBUG` 过滤。
 - [ ] **P0→P1 — 帧率联动**: `EnumFormat`/`Format` 当前写死 `30fps`, 未与 3A
