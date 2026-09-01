@@ -23,6 +23,12 @@
 extern "C" {
 #endif
 
+/* Forward declaration of the SPA logging interface (<spa/support/log.h>).
+ * The backend logs through this standard channel so its messages land in
+ * the same PipeWire pw_log stream as the SPA node, with level filtering
+ * instead of raw fprintf(stderr).  May be NULL (logging disabled). */
+struct spa_log;
+
 /* Opaque handle to one configured+startable camera stream. */
 struct camhal_backend;
 
@@ -48,9 +54,12 @@ void camhal_free_cameras(struct camhal_camera_info *cams, int count);
 /*
  * Create a backend for the given CamHAL camera_id.
  * This performs camera_hal_init() (ref-counted) + camera_device_open().
+ * \param log  SPA logging interface to emit diagnostics through
+ *             (optional, may be NULL to silence non-fatal messages).
  * Returns NULL on failure.  Destroys with camhal_backend_destroy().
  */
-struct camhal_backend *camhal_backend_create(int camera_id);
+struct camhal_backend *camhal_backend_create(int camera_id,
+					     struct spa_log *log);
 
 /*
  * Query the frame size the HAL wants for (format NV12, width x height).
@@ -68,6 +77,7 @@ struct camhal_resolution {
  * Enumerate the NV12 resolutions the HAL actually supports for the given
  * camera.  Fills at most \a max_count entries into \a outs and returns the
  * number written (<= max_count).  Returns negative errno on failure.
+ * \param log  optional SPA logging interface for diagnostics (may be NULL).
  *
  * This queries getSupportedStreamConfig(), so it does NOT open the camera
  * (no camera_device_open()/config_streams() needed) and therefore does not
@@ -75,7 +85,8 @@ struct camhal_resolution {
  */
 int camhal_backend_get_supported_formats(int camera_id,
 					 struct camhal_resolution *outs,
-					 int max_count);
+					 int max_count,
+					 struct spa_log *log);
 
 /*
  * Tunable 3A parameters.  Zero / negative "keep" values mean "don't change

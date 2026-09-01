@@ -36,7 +36,7 @@ int main(void)
         for (int i = 0; i < count; i++) {
                 int id = cams[i].camera_id;
                 printf("=== cam %s (id=%d) ===\n", cams[i].name, id);
-                struct camhal_backend *b = camhal_backend_create(id);
+                struct camhal_backend *b = camhal_backend_create(id, NULL);
                 if (!b) { printf("  create failed\n"); continue; }
                 int stride = 0, size = 0;
                 if (camhal_backend_configure(b, 640, 480, 4, &stride, &size) < 0) {

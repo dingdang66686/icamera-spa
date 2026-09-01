@@ -29,11 +29,32 @@
 #include <unistd.h>
 #include <new>
 
+#include <spa/support/log.h>
+
 #include <libcamhal/api/ICamera.h>
 #include <libcamhal/api/Parameters.h>
 #include <libcamhal/linux/videodev2.h>
 
 using namespace icamera;
+
+/* ------------------------------------------------------------------ */
+/* Logging helpers                                                     */
+/*                                                                     */
+/* All diagnostics go through the standard SPA logging interface the   */
+/* SPA node provided at create time, so they land in the same PipeWire */
+/* pw_log stream (filterable by level / component) instead of raw      */
+/* fprintf(stderr).  NULL log => logging disabled.  Messages are       */
+/* prefixed "camhal" (the SPA logger already tags level + component).  */
+/* ------------------------------------------------------------------ */
+
+#define CAM_LOG_ERR(b, ...) \
+	do { if ((b) && (b)->log) spa_log_error((b)->log, __VA_ARGS__); } while (0)
+#define CAM_LOG_WARN(b, ...) \
+	do { if ((b) && (b)->log) spa_log_warn((b)->log, __VA_ARGS__); } while (0)
+#define CAM_LOG_INFO(b, ...) \
+	do { if ((b) && (b)->log) spa_log_info((b)->log, __VA_ARGS__); } while (0)
+#define CAM_LOG_DEBUG(b, ...) \
+	do { if ((b) && (b)->log) spa_log_debug((b)->log, __VA_ARGS__); } while (0)
 
 /* ------------------------------------------------------------------ */
 /* Global, ref-counted camera_hal_init/deinit so multiple SPA node      */
@@ -143,6 +164,9 @@ void camhal_free_cameras(struct camhal_camera_info *cams, int count)
 	int    n_buffers;
 	int    running;
 
+	/* Standard SPA logging interface (from create()), may be NULL. */
+	struct spa_log *log;
+
 	/* Last-applied 3A settings (persisted so start() can reapply and so a
 	 * later set_3a() call has a baseline). */
 	struct camhal_3a_settings s3a;
@@ -188,7 +212,8 @@ long camhal_backend_get_frame_size(int camera_id, int width, int height)
 
 int camhal_backend_get_supported_formats(int camera_id,
 					 struct camhal_resolution *outs,
-					 int max_count)
+					 int max_count,
+					 struct spa_log *log)
 {
 	if (!outs || max_count <= 0)
 		return -EINVAL;
@@ -222,11 +247,12 @@ int camhal_backend_get_supported_formats(int camera_id,
 		n++;
 	}
 
-	fprintf(stderr, "camhal: camera %d supports %d NV12 resolution(s)\n",
-		camera_id, n);
-	for (int i = 0; i < n; i++)
-		fprintf(stderr, "camhal:   [%d] %ux%u\n",
-			i, outs[i].width, outs[i].height);
+	if (log)
+		spa_log_info(log, "camhal: camera %d supports %d NV12 resolution(s)",
+			     camera_id, n);
+	for (int i = 0; i < n && log; i++)
+		spa_log_debug(log, "camhal:   [%d] %ux%u",
+			      i, outs[i].width, outs[i].height);
 
 	return n;
 }
@@ -237,7 +263,8 @@ int camhal_backend_get_supported_formats(int camera_id,
  * zeroed struct simply re-applies the auto baseline (AE/AWB AUTO + 30fps),
  * which is what keeps the request/3A/PSYS pipeline from stalling.
  */
-static int push_3a(int camera_id, const struct camhal_3a_settings *s)
+static int push_3a(int camera_id, const struct camhal_3a_settings *s,
+		   struct spa_log *log)
 {
 	icamera::Parameters p;
 	int ret;
@@ -273,12 +300,14 @@ static int push_3a(int camera_id, const struct camhal_3a_settings *s)
 		p.setRun3ACadence(s->run_3a_cadence);
 
 	ret = camera_set_parameters(camera_id, p);
-	if (ret != 0)
-		fprintf(stderr, "camhal: camera_set_parameters ret=%d\n", ret);
-	else
-		fprintf(stderr, "camhal: pushed 3A (ae=%d awb=%d fr=%.0f)"
-			"\n", s->ae_mode, s->awb_mode,
-			s->frame_rate > 0 ? s->frame_rate : 30.0f);
+	if (ret != 0) {
+		if (log)
+			spa_log_warn(log, "camhal: camera_set_parameters ret=%d", ret);
+	} else if (log) {
+		spa_log_debug(log, "camhal: pushed 3A (ae=%d awb=%d fr=%.0f)",
+			      s->ae_mode, s->awb_mode,
+			      s->frame_rate > 0 ? s->frame_rate : 30.0f);
+	}
 	return ret == 0 ? 0 : -EIO;
 }
 
@@ -290,10 +319,11 @@ int camhal_backend_set_3a(struct camhal_backend *b,
 	/* Persist the settings so start() can re-apply the same configuration
 	 * after a restart without the plugin having to call this again. */
 	b->s3a = *s;
-	return push_3a(b->camera_id, s);
+	return push_3a(b->camera_id, s, b->log);
 }
 
-struct camhal_backend *camhal_backend_create(int camera_id)
+struct camhal_backend *camhal_backend_create(int camera_id,
+					     struct spa_log *log)
 {
 	struct camhal_backend *b = new (std::nothrow) struct camhal_backend;
 	if (!b)
@@ -301,6 +331,7 @@ struct camhal_backend *camhal_backend_create(int camera_id)
 
 	memset(b, 0, sizeof(*b));
 	b->camera_id = camera_id;
+	b->log = log;
 	pthread_mutex_init(&b->lock, NULL);
 
 	if (hal_ref() < 0) {
@@ -332,9 +363,9 @@ struct camhal_backend *camhal_backend_create(int camera_id)
 		 * push_3a with defaults so the pipeline gets an explicit kick. */
 		if (b->s3a.ae_mode != 0 || b->s3a.frame_rate > 0 ||
 		    b->s3a.awb_mode >= 0 || b->s3a.apply_awb_gains)
-			push_3a(camera_id, &b->s3a);
+			push_3a(camera_id, &b->s3a, log);
 		else
-			push_3a(camera_id, &def);
+			push_3a(camera_id, &def, log);
 	}
 
 	return b;
@@ -375,8 +406,8 @@ int camhal_backend_configure(struct camhal_backend *b,
 		}
 	}
 	if (!found) {
-		fprintf(stderr, "camhal: no supported NV12 %dx%d stream, "
-			"falling back to hand-built stream\n", width, height);
+		CAM_LOG_WARN(b, "camhal: no supported NV12 %dx%d stream, "
+			     "falling back to hand-built stream", width, height);
 		stream.format    = V4L2_PIX_FMT_NV12;
 		stream.width     = width;
 		stream.height    = height;
@@ -418,10 +449,10 @@ int camhal_backend_configure(struct camhal_backend *b,
 	if (camera_device_config_streams(b->camera_id, &config) < 0)
 		return -EIO;
 
-	fprintf(stderr, "camhal: config_streams OK stream.id=%d format=0x%x "
-		"%dx%d stride=%d size=%d field=%d usage=0x%x\n",
-		stream.id, stream.format, stream.width, stream.height,
-		stream.stride, stream.size, stream.field, stream.usage);
+	CAM_LOG_INFO(b, "camhal: config_streams OK stream.id=%d format=0x%x "
+		     "%dx%d stride=%d size=%d field=%d usage=0x%x",
+		     stream.id, stream.format, stream.width, stream.height,
+		     stream.stride, stream.size, stream.field, stream.usage);
 
 	b->stream_id = stream.id;
 	b->stream_width = width;
@@ -472,7 +503,7 @@ int camhal_backend_configure(struct camhal_backend *b,
 		buf->index = i;
 
 		if (posix_memalign(&buf->addr, getpagesize(), bufsz) != 0) {
-			fprintf(stderr, "camhal: posix_memalign %d failed\n", i);
+			CAM_LOG_ERR(b, "camhal: posix_memalign %d failed", i);
 			free(buf);
 			for (int j = 0; j < i; j++) {
 				if (b->buffers[j]) {
@@ -486,8 +517,8 @@ int camhal_backend_configure(struct camhal_backend *b,
 			return -ENOMEM;
 		}
 		b->buffers[i] = buf;
-		fprintf(stderr, "camhal: userptr buffer %d addr=%p size=%zu\n",
-			i, buf->addr, bufsz);
+		CAM_LOG_DEBUG(b, "camhal: userptr buffer %d addr=%p size=%zu",
+			      i, buf->addr, bufsz);
 	}
 
 	/*
@@ -542,9 +573,9 @@ int camhal_backend_start(struct camhal_backend *b)
 		def.awb_mode = -1; /* keep default (AUTO) */
 		if (b->s3a.ae_mode != 0 || b->s3a.frame_rate > 0 ||
 		    b->s3a.awb_mode >= 0 || b->s3a.apply_awb_gains)
-			push_3a(b->camera_id, &b->s3a);
+			push_3a(b->camera_id, &b->s3a, b->log);
 		else
-			push_3a(b->camera_id, &def);
+			push_3a(b->camera_id, &def, b->log);
 	}
 
 	if (camera_device_start(b->camera_id) < 0)
@@ -590,8 +621,8 @@ int camhal_backend_dqbuf(struct camhal_backend *b,
 					}
 					b->dbg_frames++;
 					if ((b->dbg_frames % 5) == 1)
-						fprintf(stderr,
-							"camhal: SRC-CONTENT diff=%.4f frames=%ld idx=%d seq=%ld frame=%u ts=%lu\n",
+						CAM_LOG_DEBUG(b,
+							"camhal: SRC-CONTENT diff=%.4f frames=%ld idx=%d seq=%ld frame=%u ts=%lu",
 							(double)total / (double)cnt,
 							b->dbg_frames, buf->index,
 							(long)buf->sequence, buf->frameNumber,
@@ -609,7 +640,8 @@ int camhal_backend_dqbuf(struct camhal_backend *b,
 			{
 				static long nd = 0;
 				if ((++nd % 200) == 1)
-					fprintf(stderr, "camhal: DQB idx=%d seq=%ld frame=%u ts=%lu\n",
+					CAM_LOG_DEBUG(b,
+						"camhal: DQB idx=%d seq=%ld frame=%u ts=%lu",
 						buf->index, (long)buf->sequence,
 						buf->frameNumber, (unsigned long)buf->timestamp);
 			}
@@ -636,10 +668,10 @@ int camhal_backend_dqbuf(struct camhal_backend *b,
 			oldest->sequence = -1;
 			oldest->timestamp = 0;
 			if (camera_stream_qbuf(b->camera_id, &oldest, 1, NULL) < 0)
-				fprintf(stderr, "camhal: qbuf(inflight) failed\n");
+				CAM_LOG_ERR(b, "camhal: qbuf(inflight) failed");
 			else
-				fprintf(stderr,
-					"camhal: requeue idx=%d (oldest of %d)\n",
+				CAM_LOG_DEBUG(b,
+					"camhal: requeue idx=%d (oldest of %d)",
 					oldest->index, INFLIGHT_DEPTH);
 			b->inflight_head =
 				(b->inflight_head + 1) % INFLIGHT_DEPTH;

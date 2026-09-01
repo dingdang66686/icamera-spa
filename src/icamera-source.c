@@ -58,6 +58,25 @@
 
 #define MAX_BUFFERS 32
 
+/* ------------------------------------------------------------------ */
+/* Logging helpers                                                     */
+/*                                                                     */
+/* Every diagnostic goes through the standard SPA logging interface    */
+/* (impl->log, provided by PipeWire / the SPA loader).  This makes the */
+/* messages land in pw_log with component + level tags and lets them   */
+/* be filtered (SPA_DEBUG / PW_LOG) instead of raw fprintf(stderr).    */
+/* NULL log => logging disabled.                                      */
+/* ------------------------------------------------------------------ */
+
+#define ICAM_LOG_ERR(i, ...) \
+	do { if ((i) && (i)->log) spa_log_error((i)->log, __VA_ARGS__); } while (0)
+#define ICAM_LOG_WARN(i, ...) \
+	do { if ((i) && (i)->log) spa_log_warn((i)->log, __VA_ARGS__); } while (0)
+#define ICAM_LOG_INFO(i, ...) \
+	do { if ((i) && (i)->log) spa_log_info((i)->log, __VA_ARGS__); } while (0)
+#define ICAM_LOG_DEBUG(i, ...) \
+	do { if ((i) && (i)->log) spa_log_debug((i)->log, __VA_ARGS__); } while (0)
+
 #define GET_OUT_PORT(i) (&(i)->out_port)
 
 /* ------------------------------------------------------------------ */
@@ -203,7 +222,8 @@ static void *capture_thread_main(void *data)
 					if (v > tmax) tmax = v;
 					tsum += v;
 				}
-				fprintf(stderr, "icamera: dqbuf tmpbuf size=%zu luminmin=%u max=%u avg=%.1f ts=%lu\n",
+				ICAM_LOG_DEBUG(impl,
+					"capture dqbuf tmpbuf size=%zu lumin(min=%u max=%u avg=%.1f) ts=%lu",
 					tn, tmin, tmax, tchroma ? (double)tsum / tchroma : 0,
 					(unsigned long)ts);
 			}
@@ -234,8 +254,8 @@ static void *capture_thread_main(void *data)
 				 * warming up early and forward from the next frame. */
 				if (n && (double)tsum / n > 10.0)
 					warm = 12;
-				fprintf(stderr, "icamera: warmup %u avg=%.1f (drop)\n",
-					warm, n ? (double)tsum / n : 0.0);
+				ICAM_LOG_DEBUG(impl, "warmup %u avg=%.1f (drop)",
+					       warm, n ? (double)tsum / n : 0.0);
 				continue;
 			}
 		}
@@ -304,8 +324,8 @@ static void *capture_thread_main(void *data)
 				{
 					static unsigned long appn = 0;
 					if ((++appn % 50) == 1)
-						fprintf(stderr,
-							"icamera: APPEND #%lu buf=%u pts=%lu ts=%lu nbuf=%u\n",
+						ICAM_LOG_DEBUG(impl,
+							"APPEND #%lu buf=%u pts=%lu ts=%lu nbuf=%u",
 							appn, frame->id,
 							(unsigned long)frame->pts, (unsigned long)ts,
 							impl->out_port.n_buffers);
@@ -314,8 +334,8 @@ static void *capture_thread_main(void *data)
 			{
 				static long capn2 = 0;
 				if ((++capn2 % 30) == 1)
-					fprintf(stderr, "icamera: capture appended=%d nb=%u\n",
-						frame != NULL, impl->out_port.n_buffers);
+					ICAM_LOG_DEBUG(impl, "capture appended=%d nb=%u",
+						       frame != NULL, impl->out_port.n_buffers);
 			}
 			pthread_mutex_unlock(&impl->out_port.queue_lock);
 		} /* backpressure block */
@@ -347,7 +367,7 @@ static int camhal_start(struct impl *impl)
 
 	/* Lazily open the camera now that streaming is actually requested. */
 	if (impl->backend == NULL) {
-		impl->backend = camhal_backend_create(impl->camera_id);
+		impl->backend = camhal_backend_create(impl->camera_id, impl->log);
 		if (impl->backend == NULL) {
 			if (impl->log)
 				spa_log_error(impl->log,
@@ -674,12 +694,12 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 
 	switch (SPA_NODE_COMMAND_ID(command)) {
 	case SPA_NODE_COMMAND_Start:
-		fprintf(stderr, "icamera: got Start command\n");
+		ICAM_LOG_INFO(impl, "command: Start");
 		res = camhal_start(impl);
 		break;
 	case SPA_NODE_COMMAND_Pause:
 	case SPA_NODE_COMMAND_Suspend:
-		fprintf(stderr, "icamera: got Pause/Suspend\n");
+		ICAM_LOG_INFO(impl, "command: Pause/Suspend");
 		camhal_stop(impl);
 		break;
 	default:
@@ -989,8 +1009,8 @@ static int icamera_alloc_buffers(struct impl *impl, struct port *port,
 		frame->link.next = NULL;
 		frame->link.prev = NULL;
 
-		fprintf(stderr, "icamera: ALLOC buf[%u] type=%u fd=%d data=%p max=%u\n",
-			i, d->type, d->fd, (void*)d->data, d->maxsize);
+		ICAM_LOG_DEBUG(impl, "ALLOC buf[%u] type=%u fd=%d data=%p max=%u",
+			       i, d->type, d->fd, (void*)d->data, d->maxsize);
 	}
 
 	port->n_buffers = n_buffers;
@@ -1011,8 +1031,8 @@ static int impl_node_port_use_buffers(void *object,
 	if (n_buffers > MAX_BUFFERS)
 		return -ENOSPC;
 
-	fprintf(stderr, "icamera: use_buffers dir=%d port=%u flags=%u nbuf=%u\n",
-		direction, port_id, flags, n_buffers);
+	ICAM_LOG_INFO(impl, "use_buffers dir=%u port=%u flags=0x%x nbuf=%u",
+		      direction, port_id, flags, n_buffers);
 
 	pthread_mutex_lock(&port->queue_lock);
 	if (port->n_buffers > 0)
@@ -1038,8 +1058,8 @@ static int impl_node_port_use_buffers(void *object,
 		if (d->maxsize == 0)
 			d->maxsize = (uint32_t)port->data_size;
 		if ((i % 8) == 0)
-			fprintf(stderr,
-				"icamera: ub[%u] type=%u data=%p fd=%d max=%u chunk=%p\n",
+			ICAM_LOG_DEBUG(impl,
+				"ub[%u] type=%u data=%p fd=%d max=%u chunk=%p",
 				i, d->type, (void*)d->data, d->fd, d->maxsize, (void*)d->chunk);
 
 		frame->id = i;
@@ -1114,8 +1134,8 @@ static int impl_node_port_reuse_buffer(void *object,
 	{
 		static long nb = 0;
 		if ((++nb % 200) == 1)
-			fprintf(stderr, "icamera: reuse_buffer id=%d qempty=%d\n",
-				buffer_id, spa_list_is_empty(&port->queue));
+			ICAM_LOG_DEBUG(impl, "reuse_buffer id=%d qempty=%d",
+				       buffer_id, spa_list_is_empty(&port->queue));
 	}
 	return 0;
 }
@@ -1129,9 +1149,9 @@ static int impl_node_process(void *object)
 
 	static long proc_count = 0;
 	if (++proc_count == 1 || (proc_count % 500) == 0)
-		fprintf(stderr, "icamera: process() called=%ld io=%p nbuf=%u status=%d\n",
-			proc_count, (void*)io, port->n_buffers,
-			io ? io->status : -1);
+		ICAM_LOG_DEBUG(impl, "process() called=%ld io=%p nbuf=%u status=%d",
+			       proc_count, (void*)io, port->n_buffers,
+			       io ? io->status : -1);
 
 	if (io == NULL || port->n_buffers == 0)
 		return -EIO;
@@ -1172,9 +1192,9 @@ static int impl_node_process(void *object)
 	{
 		static unsigned long emi = 0;
 		if ((++emi % 50) == 1)
-			fprintf(stderr, "icamera: EMIT #%lu frame id=%u pts=%lu nbuf=%u qempty=%d\n",
-				emi, frame->id, (unsigned long)frame->pts,
-				port->n_buffers, (int)spa_list_is_empty(&port->queue));
+			ICAM_LOG_DEBUG(impl, "EMIT #%lu frame id=%u pts=%lu nbuf=%u qempty=%d",
+				       emi, frame->id, (unsigned long)frame->pts,
+				       port->n_buffers, (int)spa_list_is_empty(&port->queue));
 	}
 	return SPA_STATUS_HAVE_DATA;
 }
@@ -1455,7 +1475,8 @@ static int impl_init(const struct spa_handle_factory *factory,
 	impl->n_res = camhal_backend_get_supported_formats(impl->camera_id,
 							   impl->res,
 							   (int)(sizeof(impl->res) /
-								 sizeof(impl->res[0])));
+								 sizeof(impl->res[0])),
+							   impl->log);
 	if (impl->n_res <= 0) {
 		/* Fall back to a sane default if enumeration failed. */
 		impl->n_res = 1;

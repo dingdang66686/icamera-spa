@@ -19,7 +19,7 @@ int main(void)
 	for (int i = 0; i < count; i++) {
 		int id = cams[i].camera_id;
 		printf("\n=== create(%d) ===\n", id);
-		struct camhal_backend *b = camhal_backend_create(id);
+		struct camhal_backend *b = camhal_backend_create(id, NULL);
 		if (!b) { printf("  create FAILED\n"); continue; }
 		printf("  create OK\n");
 
