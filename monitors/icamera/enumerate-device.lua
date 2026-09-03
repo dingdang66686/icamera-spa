@@ -65,6 +65,11 @@ for i, cam in ipairs (cameras) do
     ["device.name"]      = cam.device,
     ["object.path"]      = cam.name,   -- 关键：GStreamer/portal 用 object.path 定位节点
     ["media.class"]      = "Video/Source",
+    -- media.type 是标准 Video/Source 节点必需的属性。Firefox/OBS/pipewiresrc 等
+    -- 客户端按 media.class=Video/Source + media.type=Video 来发现和链接视频源；
+    -- 缺 *media.type* 会导致它们在 PipeWire 里枚举不到此相机（gst target-not-found
+    -- 同源问题）。必须显式设为 Video。
+    ["media.type"]       = "Video",
     ["media.role"]       = "Camera",
     ["device.api"]       = "icamera",
     ["node.pause-on-idle"] = false,
