@@ -21,8 +21,9 @@ PipeWire `Video/Source` 节点呈现给桌面/应用（如 Camera、Video 会议
 - **直接对接 libcamhal**: C/C++ 桥接 C 接口, 说话 `icamera::` C++ API（`ICamera.h`）。
 - **多 buffer 在途管线**: 复刻 `icamerasrc` 的 qbuf/dqbuf 节奏（`INFLIGHT_DEPTH=6`），
   避免 HAL 请求/3A/PSYS 管线因单 buffer 而 stall。
-- **动态分辨率枚举**: 通过 `getSupportedStreamConfig()` 查询 HAL 真实支持的 NV12 分辨率，
-  无需打开摄像头即可在节点 init 时枚举。
+- **动态分辨率枚举**: 通过 `getSupportedStreamConfig()` 查询 HAL 真实支持的
+  （格式,分辨率）组合，无需打开摄像头即可在节点 init 时枚举（当前 sensor 上报 NV12，
+  代码保持通用，见路线图"多格式协商/原样搬运"）。
 - **运行时动态 3A 控制**: 通过 SPA `Props` 的 `params` 通道, 用 `pw-cli` 即可在 streaming
   中修改曝光/增益/AWB, 无需重启节点。
 - **WirePlumber 自动发现**: Lua monitor + 原生 Lua C 模块动态枚举真实内置相机
@@ -260,11 +261,31 @@ SPA_DEBUG=4 systemctl --user restart wireplumber
       贯通到节点级与端口级的 `EnumFormat`/`Format`；运行时通过
       `api.icamera.frame-rate` 动态修改时同步更新。未设置时回退 30fps；并支持
       NTSC 分频（29.97→30000/1001、59.94→60000/1001、23.976→24000/1001）。
-- [ ] **P1 — 多种像素格式**: 目前仅 NV12。支持 BGRx 等格式 / 转换, 以便 RGB-IR
-      交叉验证。
-- [ ] **P1 — 时钟/时序对齐**: `SPA_NODE_FLAG_RT` 但采集线程非 RT 线程, 无自定义
-      Clock 提供。
-- [ ] **P1 — Props/PropInfo 枚举完整性**: 端口 PropInfo 标为 READ 但未实现完整描述。
+- [x] **P1 — 零拷贝采集**: 提供两条无 memcpy 直通路径可自动协商——
+      **R-A direct（USERPTR 零拷贝）**：当 HAL 无行 padding（stride==width）时，下游
+      SPA 输出 buffer 直接作为 HAL 的 USERPTR 缓冲，HAL 把帧写进（同时也就是）输出
+      buffer，采集线程仅做 dqbuf/时序推进；**R-B dmabuf（V4L2_MEMORY_DMABUF）**：
+      当 peer 协商 `SPA_DATA_DmaBuf` 时，把输出 fd 直接交给 HAL 硬件写帧，对 CPU
+      消费端做同步（sync read/write）。任一失败时回退 R-A direct（memfd）或 R-B
+      copy 路径。注意直接模式要求 packed（stride==width），有 padding 的格式仍需
+      CPU 逐行剥离（见 P0 Stride）。
+- [x] **P1 — 多格式协商/原样搬运（非插件内格式转换）**: `v4l2_fourcc_to_spa` 已覆盖
+      NV12/NV21/YUY2/UYVY/I420/YV12/GRAY8/RGB/BGR/RGB16 十种映射；`EnumFormat`/`Format`
+      通过 `getSupportedStreamConfig()` 上报 HAL 实际支持、且能映射成 SPA 格式的所有
+      组合（`SPA_VIDEO_FORMAT_UNKNOWN` 的会被跳过），`set_format` 只接受同时满足
+      "可映射回 fourcc **且** 在 HAL 支持集内"的协商。**插件不做真正的像素格式转换**：
+      对协商到的格式一律原样打包 + 按需剥离 stride padding 搬运。格式转换（如 RGB-IR
+      的 debayer、NV12↔RGB 等）交由**下游 videoconvert/libcamera** 处理，避免在 source
+      内软转拖累零拷贝路径。→ 剩项为逐格式验证后端配置/`v4l2_format_size` 的贯通。
+- [x] **P1 — 时钟对齐**: 节点以 `SPA_NODE_FLAG_RT` 标记驱动采集节奏；采集线程按
+      HAL 帧率推进并统一到 SPA 时钟域（`SPA_NODE_FLAG_RT` + 帧率推导），配合 P0 帧率
+      联动的 `out_framerate`，保证协商帧率与真实输出一致。未提供自定义 `Clock` 对象
+      （沿用 PipeWire 系统时钟）。
+- [x] **P1 — Props/PropInfo 枚举**: 端口 PropInfo 完整枚举 12 个 tunable 属性
+      （exposure/gain/ae-mode/awb-*/frame-rate/3a-cadence 等），`set_param` 透传到
+      HAL，支持 streaming 中动态修改。
+- [ ] **P1 — 多格式逐格式实测**: 在 HAL 实际支持多种格式的传感器上，逐格式验证
+      枚举/协商/后端配置/打包搬运（当前机器传感器仅上报 NV12，已实测）。
 - [ ] **P1 — HAL metadata 透传**: 曝光/3A statistics 等 metadata 尚未透传到管线。
 
 ---
