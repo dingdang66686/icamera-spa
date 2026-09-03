@@ -288,6 +288,14 @@ struct impl {
 	/* one output port */
 	struct port out_port;
 
+	/* Node-level SPA_IO_Clock block, set by the host via impl_node_set_io
+	 * when the graph drives (or observes) the node clock.  Used to stamp
+	 * frame pts in the driver's clock domain instead of a purely local
+	 * CLOCK_MONOTONIC read, so downstream sinks sync to a consistent time
+	 * base.  NULL when the host has not wired clock IO (falls back to
+	 * local mono). */
+	struct spa_io_clock *clock;
+
 	/* node properties */
 	char node_name[64];
 	char node_description[64];
@@ -363,10 +371,52 @@ static void icamera_dmabuf_end_cpu_write(int fd)
 }
 #endif /* ENABLE_DMA_BUF */
 
+/* Timestamp helper for clock/timing alignment.
+ *
+ * We want every frame's pts to live in the SAME time base the PipeWire graph
+ * uses, so a downstream video sink (which syncs to the driver clock) can make
+ * progress without drift/jitter across ports or consumers.
+ *
+ * When the host wires a node-level SPA_IO_Clock (impl->clock), spa_io_clock::nsec
+ * is the driver's clock read on the CLOCK_MONOTONIC base -- the graph's notion
+ * of "now".  Prefer it over a local clock_gettime() so pts of all our frames
+ * are stamped from the same graph-visible instant.  Fall back to a local mono
+ * read when no clock IO was supplied (e.g. a bare driver-less consumer).
+ */
+static uint64_t icamera_now_nsec(const struct impl *impl)
+{
+	const struct spa_io_clock *ck = impl->clock;
+	if (ck && ck->nsec > 0)
+		return ck->nsec;
+	struct timespec mono;
+	clock_gettime(CLOCK_MONOTONIC, &mono);
+	return (uint64_t)mono.tv_sec * SPA_NSEC_PER_SEC +
+	       (uint64_t)mono.tv_nsec;
+}
+
+/* Try to raise the current capture thread to a real-time schedule class so
+ * its qbuf/dqbuf -> queue delivery cadence stays steady (fewer scheduling
+ * hiccups between sensor frames).  Best-effort: without CAP_SYS_NICE this
+ * fails gracefully and we keep the normal scheduler.  Priority 25 sits just
+ * below real-time audio/RT processing (30), keeping this producer below
+ * time-critical audio callbacks but above ordinary tasks.
+ */
+static void icamera_thread_rt(void)
+{
+	struct sched_param sp = { 0 };
+
+	sp.sched_priority = 25;
+	if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
+		sp.sched_priority = 0; /* ignore: no RT permission */
+}
+
 static void *capture_thread_main(void *data)
 {
 	struct impl *impl = data;
 	uint32_t i;
+
+	/* Try to run steady at a real-time class for even frame delivery. */
+	icamera_thread_rt();
 
 	while (!impl->capture_stop) {
 		uint64_t ts = 0;
@@ -530,12 +580,7 @@ static void *capture_thread_main(void *data)
 				 * this to know when to show each frame; a pts of 0 on
 				 * every frame makes autovideosink stall because it can
 				 * make no progress on the clock. */
-				{
-					struct timespec mono;
-					clock_gettime(CLOCK_MONOTONIC, &mono);
-					frame->pts = (uint64_t)mono.tv_sec * SPA_NSEC_PER_SEC +
-						     (uint64_t)mono.tv_nsec;
-				}
+				frame->pts = icamera_now_nsec(impl);
 				SPA_FLAG_SET(frame->flags, 1);
 				spa_list_append(&impl->out_port.queue, &frame->link);
 				{
@@ -583,6 +628,9 @@ static void *capture_thread_main_direct(void *data)
 {
 	struct impl *impl = data;
 
+	/* Try to run steady at a real-time class for even frame delivery. */
+	icamera_thread_rt();
+
 	ICAM_LOG_DEBUG(impl, "DIRECT thread entered (zero-copy, official "
 		       "USERPTR-aligned: consumer-driven requeue only)");
 
@@ -614,12 +662,7 @@ static void *capture_thread_main_direct(void *data)
 
 		/* Present the frame.  Set its pts on the monotonic clock for the
 		 * sink, mark it filled/outstanding, and queue it for process(). */
-		{
-			struct timespec mono;
-			clock_gettime(CLOCK_MONOTONIC, &mono);
-			frame->pts = (uint64_t)mono.tv_sec * SPA_NSEC_PER_SEC +
-				     (uint64_t)mono.tv_nsec;
-		}
+		frame->pts = icamera_now_nsec(impl);
 		if (frame->outbuf && frame->outbuf->n_datas > 0 &&
 		    frame->outbuf->datas[0].chunk)
 			frame->outbuf->datas[0].chunk->size =
@@ -961,6 +1004,133 @@ static int build_enum_format(struct impl *impl, struct spa_pod_builder *b,
 	return 0;
 }
 
+/* Does this port carry a negotiated Format yet?  Used for PropInfo of the
+ * format family so we don't advertise an empty size/rate before negotiation. */
+static bool port_has_format(const struct port *port)
+{
+	return port->have_format;
+}
+
+/* Kind of a property we describe in PropInfo. */
+enum prop_kind {
+	PROP_INT,   /* spa_pod_int      */
+	PROP_LONG,  /* spa_pod_long     */
+	PROP_FLOAT, /* spa_pod_float    */
+	PROP_ID,    /* spa_pod_id       (an enum/pick)  */
+	PROP_RECT,  /* spa_pod_rectangle               */
+	PROP_FRAC,  /* spa_pod_fraction                */
+};
+
+/* Build the "(name, type, description)" of one property as an
+ * SPA_TYPE_OBJECT_PropInfo result.  Returns 0 and sets *out on success,
+ * or -ENOENT when idx has walked past the end of the property table (which
+ * tells the caller to stop enumerating).
+ *
+ * These are the properties a client can actually observe or tune on this
+ * icamera port:
+ *   - the api.icamera.* 3A knobs, exposed read/write through the node-level
+ *     Props::params channel (marked params=1 so tooling knows they belong to
+ *     that channel);
+ *   - the negotiated output format family (format / video.size /
+ *     video.framerate), reflecting what the port is currently producing.
+ * This makes SPA_PARAM_PropInfo enumerable end-to-end (previously the port
+ * param table claimed READ but the enum switch had no PropInfo branch, so
+ * every read fell through to -ENOENT).
+ */
+static int build_port_propinfo(struct impl *impl, struct port *port,
+			       struct spa_pod_builder *b, int idx,
+			       struct spa_pod **out)
+{
+#define MAX_PORT_PROPS 12
+	static const struct {
+		const char *name;
+		const char *desc;
+		enum prop_kind kind;
+		bool in_params;
+	} tab[MAX_PORT_PROPS] = {
+		{ "api.icamera.ae-mode",     "AE mode (0=auto,1=manual)",   PROP_INT,   true },
+		{ "api.icamera.exposure",     "exposure time (ns)",          PROP_LONG,  true },
+		{ "api.icamera.gain",         "analog gain",                 PROP_FLOAT, true },
+		{ "api.icamera.awb-mode",     "AWB mode (0=auto,1=manual)",  PROP_INT,   true },
+		{ "api.icamera.awb-r-gain",   "AWB red gain",                PROP_INT,   true },
+		{ "api.icamera.awb-g-gain",   "AWB green gain",              PROP_INT,   true },
+		{ "api.icamera.awb-b-gain",   "AWB blue gain",               PROP_INT,   true },
+		{ "api.icamera.frame-rate",   "target frame rate (fps)",     PROP_FLOAT, true },
+		{ "api.icamera.3a-cadence",   "3A run cadence",              PROP_INT,   true },
+		{ "format",                   "negotiated video format",     PROP_ID,    false },
+		{ "video.size",               "negotiated frame size",       PROP_RECT,  false },
+		{ "video.framerate",          "negotiated frame rate",       PROP_FRAC,  false },
+	};
+	/* NOTE: SPA_POD_*(val) (pod/vararg.h) expand to "<fmt-tag>", val
+	 * pairs intended to be spliced directly into the varargs of
+	 * spa_pod_builder_add_object().  They must NOT be captured into a
+	 * variable (that would treat the fmt string as a pod pointer and
+	 * crash).  Because the property type tag differs per kind, build
+	 * each object inline in its own branch. */
+	int n = (int)(sizeof(tab) / sizeof(tab[0]));
+
+	if (idx < 0 || idx >= n)
+		return -ENOENT;
+
+	if (!port_has_format(port) && tab[idx].in_params == false)
+		return -ENOENT; /* no format negotiated yet: skip format props */
+
+	switch (tab[idx].kind) {
+	case PROP_INT:
+		*out = spa_pod_builder_add_object(b,
+			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
+			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
+			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
+			SPA_PROP_INFO_type,        SPA_POD_Int(0),
+			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
+		break;
+	case PROP_LONG:
+		*out = spa_pod_builder_add_object(b,
+			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
+			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
+			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
+			SPA_PROP_INFO_type,        SPA_POD_Long(0),
+			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
+		break;
+	case PROP_FLOAT:
+		*out = spa_pod_builder_add_object(b,
+			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
+			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
+			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
+			SPA_PROP_INFO_type,        SPA_POD_Float(0.0f),
+			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
+		break;
+	case PROP_ID:
+		*out = spa_pod_builder_add_object(b,
+			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
+			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
+			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
+			SPA_PROP_INFO_type,        SPA_POD_Id(0),
+			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
+		break;
+	case PROP_RECT:
+		*out = spa_pod_builder_add_object(b,
+			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
+			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
+			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
+			SPA_PROP_INFO_type,        SPA_POD_Rectangle(&SPA_RECTANGLE(0, 0)),
+			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
+		break;
+	case PROP_FRAC:
+		*out = spa_pod_builder_add_object(b,
+			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
+			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
+			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
+			SPA_PROP_INFO_type,        SPA_POD_Fraction(&SPA_FRACTION(0, 1)),
+			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
+		break;
+	default:
+		return -EINVAL;
+	}
+	return 0;
+#undef MAX_PORT_PROPS
+}
+
 static int impl_node_enum_params(void *object, int seq,
 				 uint32_t id, uint32_t start, uint32_t num,
 				 const struct spa_pod *filter)
@@ -1174,6 +1344,15 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 
 static int impl_node_set_io(void *object, uint32_t id, void *data, size_t size)
 {
+	struct impl *impl = object;
+
+	if (id == SPA_IO_Clock && size >= sizeof(struct spa_io_clock)) {
+		/* Host supplied the node-level clock IO block.  Remember it so
+		 * frame pts are stamped in the graph's clock domain (see
+		 * icamera_now_nsec()).  NULL data just clears it. */
+		impl->clock = (struct spa_io_clock *)data;
+		return 0;
+	}
 	return 0;
 }
 
@@ -1286,6 +1465,15 @@ next:
 	spa_pod_builder_init(&b, buffer, sizeof(buffer));
 
 	switch (id) {
+	case SPA_PARAM_PropInfo:
+		/* Complete description of the tunable/exposed properties on this
+		 * port.  index walks the property table; -ENOENT stops the enum. */
+		{
+			int rr = build_port_propinfo(impl, port, &b, result.index, &param);
+			if (rr < 0)
+				return 0;
+		}
+		break;
 	case SPA_PARAM_EnumFormat:
 		/* Advertise every (format x resolution) the HAL supports.  The
 		 * index just walks impl->res[]; build_enum_format already skips
