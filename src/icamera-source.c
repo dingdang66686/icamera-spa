@@ -65,6 +65,8 @@
 #include <spa/support/log.h>
 
 #include "camhal_backend.h"
+#include "icamera-format.h"
+#include "icamera-metadata.h"
 
 #define MAX_BUFFERS 32
 
@@ -106,82 +108,11 @@
 /* ------------------------------------------------------------------ */
 /* Pixel-format helpers                                                */
 /*                                                                     */
-/* The libcamhal backend reports stream pixel formats as V4L2 fourcc   */
-/* values (e.g. 'NV12' = 0x3231564e).  The plugin negotiates with      */
-/* PipeWire in SPA_VIDEO_FORMAT_* terms.  We keep the negotiated       */
-/* format as a V4L2 fourcc in struct port (and in impl->res[]) because */
-/* that is what the backend/stream table speaks; these helpers map     */
-/* between the two spaces and compute packed frame sizes.  Formats the */
-/* HAL could never emit are simply not advertised (set_param rejects   */
-/* them), so only real sensor formats are ever negotiated.             */
+/* V4L2 fourcc <-> SPA_VIDEO_FORMAT* mapping, packed frame sizes and   */
+/* the frame-rate -> struct spa_fraction helper live in the pure       */
+/* icamera-format module (src/icamera-format.[ch]), split out so they  */
+/* carry no node/port/backend state.                                   */
 /* ------------------------------------------------------------------ */
-
-#define V4L2_FOURCC(a, b, c, d) \
-	((uint32_t)(a) | ((uint32_t)(b) << 8) | \
-	 ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
-
-/* Map a V4L2 pixel fourcc to the equivalent SPA_VIDEO_FORMAT_* id, or
- * SPA_VIDEO_FORMAT_UNKNOWN when we do not represent it in SPA. */
-static uint32_t v4l2_fourcc_to_spa(uint32_t fourcc)
-{
-	switch (fourcc) {
-	case V4L2_FOURCC('N', 'V', '1', '2'): return SPA_VIDEO_FORMAT_NV12;
-	case V4L2_FOURCC('N', 'V', '2', '1'): return SPA_VIDEO_FORMAT_NV21;
-	case V4L2_FOURCC('Y', 'U', 'Y', 'V'): return SPA_VIDEO_FORMAT_YUY2;
-	case V4L2_FOURCC('U', 'Y', 'V', 'Y'): return SPA_VIDEO_FORMAT_UYVY;
-	case V4L2_FOURCC('Y', 'U', '1', '2'): return SPA_VIDEO_FORMAT_I420;
-	case V4L2_FOURCC('Y', 'V', '1', '2'): return SPA_VIDEO_FORMAT_YV12;
-	case V4L2_FOURCC('G', 'R', 'E', 'Y'): return SPA_VIDEO_FORMAT_GRAY8;
-	case V4L2_FOURCC('R', 'G', 'B', '3'): return SPA_VIDEO_FORMAT_RGB;
-	case V4L2_FOURCC('B', 'G', 'R', '3'): return SPA_VIDEO_FORMAT_BGR;
-	case V4L2_FOURCC('R', 'G', 'B', 'P'): return SPA_VIDEO_FORMAT_RGB16;
-	default:                              return SPA_VIDEO_FORMAT_UNKNOWN;
-	}
-}
-
-/* Map a negotiated SPA_VIDEO_FORMAT_* id back to its V4L2 fourcc, or 0
- * when unknown.  Inverse of v4l2_fourcc_to_spa() for the formats above. */
-static uint32_t spa_format_to_v4l2_fourcc(uint32_t fmt)
-{
-	switch (fmt) {
-	case SPA_VIDEO_FORMAT_NV12:  return V4L2_FOURCC('N', 'V', '1', '2');
-	case SPA_VIDEO_FORMAT_NV21:  return V4L2_FOURCC('N', 'V', '2', '1');
-	case SPA_VIDEO_FORMAT_YUY2:  return V4L2_FOURCC('Y', 'U', 'Y', 'V');
-	case SPA_VIDEO_FORMAT_UYVY:  return V4L2_FOURCC('U', 'Y', 'V', 'Y');
-	case SPA_VIDEO_FORMAT_I420:  return V4L2_FOURCC('Y', 'U', '1', '2');
-	case SPA_VIDEO_FORMAT_YV12:  return V4L2_FOURCC('Y', 'V', '1', '2');
-	case SPA_VIDEO_FORMAT_GRAY8: return V4L2_FOURCC('G', 'R', 'E', 'Y');
-	case SPA_VIDEO_FORMAT_RGB:   return V4L2_FOURCC('R', 'G', 'B', '3');
-	case SPA_VIDEO_FORMAT_BGR:   return V4L2_FOURCC('B', 'G', 'R', '3');
-	case SPA_VIDEO_FORMAT_RGB16: return V4L2_FOURCC('R', 'G', 'B', 'P');
-	default:                     return 0;
-	}
-}
-
-/* Packed byte size of a V4L2 fourcc frame (no line padding).  Handles the
- * formats we advertise; unknown formats fall back to 3 bytes/pixel. */
-static size_t v4l2_format_size(uint32_t fourcc, uint32_t w, uint32_t h)
-{
-	size_t px = (size_t)w * h;
-	switch (fourcc) {
-	case V4L2_FOURCC('N', 'V', '1', '2'):
-	case V4L2_FOURCC('N', 'V', '2', '1'):
-	case V4L2_FOURCC('Y', 'U', '1', '2'):
-	case V4L2_FOURCC('Y', 'V', '1', '2'):
-		return px * 3 / 2;
-	case V4L2_FOURCC('Y', 'U', 'Y', 'V'):
-	case V4L2_FOURCC('U', 'Y', 'V', 'Y'):
-	case V4L2_FOURCC('R', 'G', 'B', 'P'):
-		return px * 2;
-	case V4L2_FOURCC('R', 'G', 'B', '3'):
-	case V4L2_FOURCC('B', 'G', 'R', '3'):
-		return px * 3;
-	case V4L2_FOURCC('G', 'R', 'E', 'Y'):
-		return px;
-	default:
-		return px * 3;
-	}
-}
 
 /* ------------------------------------------------------------------ */
 /* The frame queue shared between the libcamhal producer thread and    */
@@ -942,34 +873,8 @@ static int camhal_stop(struct impl *impl)
 /* spa_node_methods                                                   */
 /* ------------------------------------------------------------------ */
 
-/*
- * Convert a target frame rate in fps (float) to a struct spa_fraction,
- * snapping to the nearest common integer/fractional CRT frame rate.
- * fps <= 0 means "use the HAL default" and falls back to 30/1.
- *   e.g. 30.0 -> {30,1}  60.0 -> {60,1}  25.0 -> {25,1}
- *        29.97 -> {30000,1001}  59.94 -> {60000,1001}  23.976 -> {24000,1001}
- */
-static void icamera_fps_to_fraction(float fps, struct spa_fraction *frac)
-{
-	if (fps <= 0.0f) {
-		frac->num = 30;
-		frac->denom = 1;
-		return;
-	}
-	/* Common fractional (drop-frame-ish) NTSC rates. */
-	if (fps > 29.9f && fps < 30.1f) { frac->num = 30000; frac->denom = 1001; return; }
-	if (fps > 59.8f && fps < 60.2f) { frac->num = 60000; frac->denom = 1001; return; }
-	if (fps > 23.9f && fps < 24.1f) { frac->num = 24000; frac->denom = 1001; return; }
-	if (fps > 49.8f && fps < 50.2f) { frac->num = 50;    frac->denom = 1;    return; }
-	/* Otherwise snap to the nearest integer fps. */
-	long n = (long)lrintf((double)fps);
-	if (n < 1)
-		n = 1;
-	frac->num = (uint32_t)n;
-	frac->denom = 1;
-}
-
-/* Recompute the negotiated output framerate from impl->s3a.frame_rate. */
+/* Recompute the negotiated output framerate from impl->s3a.frame_rate.
+ * The fps -> spa_fraction conversion itself lives in icamera-format.c. */
 static void icamera_update_framerate(struct impl *impl)
 {
 	icamera_fps_to_fraction(impl->s3a.frame_rate, &impl->out_framerate);
@@ -2016,80 +1921,19 @@ static int impl_node_port_reuse_buffer(void *object,
 }
 
 /*
- * Per-frame 3A metadata (custom props keys inside the SPA_META_Control /
- * SPA_CONTROL_Properties sequence we advertise).  Custom key space starts at
- * SPA_PROP_START_Custom; offsets below are stable within this plugin.
- */
-enum {
-	ICAM_META_AE_STATE  = SPA_PROP_START_CUSTOM + 0, /* int  */
-	ICAM_META_EXPOSURE  = SPA_PROP_START_CUSTOM + 1, /* long, us */
-	ICAM_META_ISO       = SPA_PROP_START_CUSTOM + 2, /* int  */
-	ICAM_META_FPS       = SPA_PROP_START_CUSTOM + 3, /* float */
-	ICAM_META_AWB_R     = SPA_PROP_START_CUSTOM + 4, /* float r/g */
-	ICAM_META_AWB_G     = SPA_PROP_START_CUSTOM + 5, /* float g/g */
-	ICAM_META_AWB_B     = SPA_PROP_START_CUSTOM + 6, /* float b/g */
-};
-
-/*
- * Fill the buffer's SPA_META_Control with the latest backend 3A results, if
- * (a) the peer allocated a Control meta and (b) the backend has captured a
- * frame's metadata yet.  Both are optional: when either is missing we skip
- * writing and the frame still flows normally (just no 3A metadata).
+ * Per-frame 3A metadata write.  The SPA_META_Control pod construction moved
+ * into the pure icamera-metadata module (src/icamera-metadata.[ch]); this thin
+ * wrapper resolves the backend's 3A snapshot and hands it off to that module.
  */
 static void icamera_write_metadata(struct impl *impl, struct frame *frame)
 {
-	struct spa_meta_control *mc = frame->control;
 	struct camhal_metadata m;
-	struct spa_pod_builder b;
-	uint8_t tmp[256];
-	struct spa_pod_frame f_seq, f_obj;
-	struct spa_pod *res;
-	int have = camhal_backend_get_metadata(impl->backend, &m);
 
-	/* If the peer did not negotiate a Control meta, or the backend does not
-	 * have 3A values yet, there is nothing to publish. */
-	if (mc == NULL)
+	if (frame->control == NULL)
 		return;
-	if (have < 0 || !m.valid)
+	if (camhal_backend_get_metadata(impl->backend, &m) < 0)
 		return;
-
-	/* Build a sequence with a single SPA_CONTROL_Properties control whose
-	 * value is a Props object carrying the 3A key/value pairs. */
-	spa_pod_builder_init(&b, tmp, sizeof(tmp));
-	spa_pod_builder_push_sequence(&b, &f_seq, 0);
-	spa_pod_builder_control(&b, 0, SPA_CONTROL_Properties);
-	spa_pod_builder_push_object(&b, &f_obj, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
-	spa_pod_builder_prop(&b, ICAM_META_AE_STATE, 0);
-	spa_pod_builder_int(&b, m.ae_state);
-	spa_pod_builder_prop(&b, ICAM_META_EXPOSURE, 0);
-	spa_pod_builder_long(&b, m.exposure_us);
-	spa_pod_builder_prop(&b, ICAM_META_ISO, 0);
-	spa_pod_builder_int(&b, m.iso);
-	spa_pod_builder_prop(&b, ICAM_META_FPS, 0);
-	spa_pod_builder_float(&b, m.fps);
-	spa_pod_builder_prop(&b, ICAM_META_AWB_R, 0);
-	spa_pod_builder_float(&b, m.awb_r_per_g);
-	spa_pod_builder_prop(&b, ICAM_META_AWB_G, 0);
-	spa_pod_builder_float(&b, m.awb_g_per_g);
-	spa_pod_builder_prop(&b, ICAM_META_AWB_B, 0);
-	spa_pod_builder_float(&b, m.awb_b_per_g);
-	spa_pod_builder_pop(&b, &f_obj);
-	res = spa_pod_builder_pop(&b, &f_seq);
-	if (res == NULL)
-		return;
-
-	/* Only blit when it fits the Control meta area reserved at negotiate
-	 * time (meta.size accounts the whole spa_meta_control). */
-	if (SPA_POD_SIZE(res) <= mc->sequence.pod.size) {
-		memcpy(&mc->sequence, res, SPA_POD_SIZE(res));
-		ICAM_LOG_DEBUG(impl,
-			"icamera: 3A meta written ae=%d exp=%lldus iso=%d "
-			"fps=%.1f awb_state=%d rgb=(%.2f,%.2f,%.2f)",
-			m.ae_state, (long long)m.exposure_us, m.iso, m.fps,
-			m.awb_state, m.awb_r_per_g, m.awb_g_per_g, m.awb_b_per_g);
-	} else if (impl->log)
-		spa_log_debug(impl->log, "icamera: 3A meta too large (%llu), skipped",
-			      (unsigned long long)SPA_POD_SIZE(res));
+	icamera_metadata_fill(frame->control, &m, impl->log);
 }
 
 static int impl_node_process(void *object)

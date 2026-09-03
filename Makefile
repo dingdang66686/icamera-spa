@@ -4,8 +4,10 @@
 # Camera HAL (libcamhal), bypassing GStreamer and v4l2loopback.
 #
 # The plugin is split into:
-#   - src/icamera-source.c   : SPA node data plane + factory (plain C, gcc)
-#   - src/camhal_backend.cpp : libcamhal capture backend     (C++, g++)
+#   - src/icamera-source.c    : SPA node data plane + factory (plain C, gcc)
+#   - src/icamera-format.c    : V4L2 fourcc / SPA format + fps helpers (pure)
+#   - src/icamera-metadata.c  : per-frame 3A SPA_META_Control writer (pure)
+#   - src/camhal_backend.cpp  : libcamhal capture backend     (C++, g++)
 #                              because libcamhal is a C++ API.
 
 CC       ?= gcc
@@ -38,7 +40,8 @@ CXXFLAGS += -DENABLE_DMA_BUF=1
 LDLIBS  += -ldrm_intel -ldrm
 endif
 
-OBJ := build/icamera-source.o build/camhal_backend.o
+OBJ := build/icamera-source.o build/icamera-format.o \
+       build/icamera-metadata.o build/camhal_backend.o
 SO  := build/libspa-icamera.so
 
 all: $(SO) build/camhal-list build/camhal.so
@@ -63,7 +66,17 @@ build/camhal-list: src/camhal-list.cpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -o $@ $< -lcamhal
 
-build/icamera-source.o: src/icamera-source.c src/camhal_backend.h
+build/icamera-source.o: src/icamera-source.c src/camhal_backend.h \
+		src/icamera-format.h src/icamera-metadata.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+build/icamera-format.o: src/icamera-format.c src/icamera-format.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+build/icamera-metadata.o: src/icamera-metadata.c src/icamera-metadata.h \
+		src/camhal_backend.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
