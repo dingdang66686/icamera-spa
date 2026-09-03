@@ -1044,6 +1044,7 @@ static int build_port_propinfo(struct impl *impl, struct port *port,
 			       struct spa_pod_builder *b, int idx,
 			       struct spa_pod **out)
 {
+	(void)impl;
 #define MAX_PORT_PROPS 12
 	static const struct {
 		const char *name;
@@ -1241,6 +1242,7 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 			       const struct spa_pod *param)
 {
 	struct impl *impl = object;
+	(void)flags;
 	const struct spa_pod_prop *prop;
 	int changed = 0;
 
@@ -1425,6 +1427,8 @@ static int impl_node_set_callbacks(void *object,
 
 static int impl_node_sync(void *object, int seq)
 {
+	(void)object;
+	(void)seq;
 	return 0;
 }
 
@@ -1433,6 +1437,10 @@ static int impl_node_add_port(void *object,
 			      uint32_t port_id,
 			      const struct spa_dict *props)
 {
+	(void)object;
+	(void)direction;
+	(void)port_id;
+	(void)props;
 	return 0;
 }
 
@@ -1440,6 +1448,9 @@ static int impl_node_remove_port(void *object,
 				 enum spa_direction direction,
 				 uint32_t port_id)
 {
+	(void)object;
+	(void)direction;
+	(void)port_id;
 	return 0;
 }
 
@@ -1456,6 +1467,7 @@ static int impl_node_port_enum_params(void *object, int seq,
 	struct spa_pod *param;
 	struct spa_result_node_params result;
 	uint32_t count = 0;
+	(void)direction;
 
 	if (port_id != 0)
 		return -EINVAL;
@@ -1517,7 +1529,7 @@ next:
 		 * SPA_CONTROL_Properties sequence.  Optional: consumers that do
 		 * not allocate it simply get no 3A metadata (we skip it). */
 		{
-			struct spa_meta_control mc = { { 0 } };
+			struct spa_meta_control mc = { 0 };
 			param = spa_pod_builder_add_object(&b,
 				SPA_TYPE_OBJECT_ParamMeta, id,
 				SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Control),
@@ -1579,6 +1591,9 @@ static int impl_node_port_set_param(void *object,
 				    const struct spa_pod *param)
 {
 	struct impl *impl = object;
+	(void)direction;
+	(void)port_id;
+	(void)flags;
 	struct port *port = GET_OUT_PORT(impl);
 	struct spa_video_info info = { 0 };
 	uint32_t fourcc, spa_fmt;
@@ -1648,6 +1663,7 @@ static int impl_node_port_set_param(void *object,
 static int icamera_clear_buffers(struct impl *impl, struct port *port)
 {
 	uint32_t i;
+	(void)impl;
 
 	for (i = 0; i < port->n_buffers; i++) {
 		struct frame *frame = &port->buffers[i];
@@ -1836,8 +1852,8 @@ static int icamera_alloc_buffers(struct impl *impl, struct port *port,
 		frame->link.next = NULL;
 		frame->link.prev = NULL;
 
-		ICAM_LOG_DEBUG(impl, "ALLOC buf[%u] type=%u fd=%d data=%p max=%u",
-			       i, d->type, d->fd, (void*)d->data, d->maxsize);
+		ICAM_LOG_DEBUG(impl, "ALLOC buf[%u] type=%u fd=%lld data=%p max=%u",
+			       i, d->type, (long long)d->fd, (void*)d->data, d->maxsize);
 	}
 
 	port->n_buffers = n_buffers;
@@ -1907,9 +1923,8 @@ static int impl_node_port_use_buffers(void *object,
 			d->maxsize = (uint32_t)port->data_size;
 		if ((i % 8) == 0)
 			ICAM_LOG_DEBUG(impl,
-				"ub[%u] type=%u data=%p fd=%d max=%u chunk=%p",
-				i, d->type, (void*)d->data, d->fd, d->maxsize, (void*)d->chunk);
-
+			"ub[%u] type=%u data=%p fd=%lld max=%u chunk=%p",
+			i, d->type, (void*)d->data, (long long)d->fd, d->maxsize, (void*)d->chunk);
 		frame->id = i;
 		frame->outbuf = buffers[i];
 		frame->flags = 0;
@@ -1932,6 +1947,8 @@ static int impl_node_port_set_io(void *object,
 {
 	struct impl *impl = object;
 	struct port *port = GET_OUT_PORT(impl);
+	(void)direction;
+	(void)port_id;
 
 	switch (id) {
 	case SPA_IO_Buffers:
@@ -2071,8 +2088,8 @@ static void icamera_write_metadata(struct impl *impl, struct frame *frame)
 			m.ae_state, (long long)m.exposure_us, m.iso, m.fps,
 			m.awb_state, m.awb_r_per_g, m.awb_g_per_g, m.awb_b_per_g);
 	} else if (impl->log)
-		spa_log_debug(impl->log, "icamera: 3A meta too large (%u), skipped",
-			      SPA_POD_SIZE(res));
+		spa_log_debug(impl->log, "icamera: 3A meta too large (%llu), skipped",
+			      (unsigned long long)SPA_POD_SIZE(res));
 }
 
 static int impl_node_process(void *object)
@@ -2301,6 +2318,7 @@ static int impl_init(const struct spa_handle_factory *factory,
 {
 	struct impl *impl = (struct impl *)handle;
 	const struct spa_dict_item *item;
+	(void)factory;
 
 	handle->get_interface = impl_get_interface;
 	handle->clear = impl_clear;
@@ -2498,6 +2516,7 @@ static int impl_enum_interface_info(const struct spa_handle_factory *factory,
 				    const struct spa_interface_info **info,
 				    uint32_t *index)
 {
+	(void)factory;
 	if (*index == 0) {
 		*info = &impl_interfaces[0];
 		(*index)++;
@@ -2509,6 +2528,8 @@ static int impl_enum_interface_info(const struct spa_handle_factory *factory,
 static size_t impl_get_size(const struct spa_handle_factory *factory,
 			 const struct spa_dict *params)
 {
+	(void)factory;
+	(void)params;
 	return sizeof(struct impl);
 }
 
