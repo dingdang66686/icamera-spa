@@ -249,8 +249,20 @@ void camhal_free_cameras(struct camhal_camera_info *cams, int count)
 	int   prev_src_size;
 	long  dbg_frames;
 
+	/* Per-frame 3A metadata snapshot (filled by dqbuf, read by the plugin).
+	 * Guarded by meta_lock so the capture thread can update it while the
+	 * plugin's emit path reads it without tearing. */
+	pthread_mutex_t meta_lock;
+	struct camhal_metadata metadata;
+
 	pthread_mutex_t lock;
 };
+
+/* Reset the per-frame metadata snapshot to "no data yet". */
+static void metadata_reset(struct camhal_backend *b)
+{
+	memset(&b->metadata, 0, sizeof(b->metadata));
+}
 
 long camhal_backend_get_frame_size(int camera_id, uint32_t format,
 				   int width, int height)
@@ -390,6 +402,8 @@ struct camhal_backend *camhal_backend_create(int camera_id,
 	b->camera_id = camera_id;
 	b->log = log;
 	pthread_mutex_init(&b->lock, NULL);
+	pthread_mutex_init(&b->meta_lock, NULL);
+	metadata_reset(b);
 
 	if (hal_ref() < 0) {
 		delete b;
@@ -844,6 +858,75 @@ int camhal_backend_start(struct camhal_backend *b)
 	return 0;
 }
 
+/*
+ * Extract the per-frame 3A results carried in a dqbuf `Parameters` output into
+ * the backend's metadata snapshot.  Called right after each successful dqbuf.
+ */
+static void metadata_capture(struct camhal_backend *b,
+			     const icamera::Parameters &settings)
+{
+	struct camhal_metadata m;
+	int ret;
+
+	memset(&m, 0, sizeof(m));
+
+	camera_ae_state_t ae = AE_STATE_NOT_CONVERGED;
+	if (settings.getAeState(ae) == 0)
+		m.ae_state = ae;
+
+	int64_t exposure = 0;
+	if (settings.getExposureTime(exposure) == 0)
+		m.exposure_us = exposure;
+
+	int iso = 0;
+	if (settings.getSensitivityIso(iso) == 0)
+		m.iso = iso;
+
+	float fps = 0.0f;
+	if (settings.getFrameRate(fps) == 0)
+		m.fps = fps;
+
+	camera_awb_state_t awb = AWB_STATE_NOT_CONVERGED;
+	if (settings.getAwbState(awb) == 0)
+		m.awb_state = awb;
+
+	camera_awb_result_t awbRes;
+	memset(&awbRes, 0, sizeof(awbRes));
+	ret = settings.getAwbResult(&awbRes);
+	if (ret == 0) {
+		/* r_per_g / b_per_g are relative to green; report green as 1.0. */
+		m.awb_r_per_g = awbRes.r_per_g;
+		m.awb_g_per_g = 1.0f;
+		m.awb_b_per_g = awbRes.b_per_g;
+	} else {
+		/* Fall back to the RGB gains if the dedicated awb_result is absent. */
+		camera_awb_gains_t gains;
+		memset(&gains, 0, sizeof(gains));
+		if (settings.getAwbGains(gains) == 0 && gains.g_gain > 0) {
+			m.awb_r_per_g = (float)gains.r_gain / (float)gains.g_gain;
+			m.awb_g_per_g = 1.0f;
+			m.awb_b_per_g = (float)gains.b_gain / (float)gains.g_gain;
+		}
+	}
+
+	m.valid = 1;
+
+	pthread_mutex_lock(&b->meta_lock);
+	b->metadata = m;
+	pthread_mutex_unlock(&b->meta_lock);
+}
+
+int camhal_backend_get_metadata(struct camhal_backend *b,
+				struct camhal_metadata *out)
+{
+	if (!b || !out)
+		return -EINVAL;
+	pthread_mutex_lock(&b->meta_lock);
+	*out = b->metadata;
+	pthread_mutex_unlock(&b->meta_lock);
+	return 0;
+}
+
 int camhal_backend_dqbuf(struct camhal_backend *b,
 			 void *dst, int size,
 			 uint64_t *out_ts)
@@ -856,10 +939,15 @@ int camhal_backend_dqbuf(struct camhal_backend *b,
 		return -EINVAL;
 
 	camera_buffer_t *buf = NULL;
+	icamera::Parameters settings;
 
-	/* Block until a frame is ready. */
-	if (camera_stream_dqbuf(b->camera_id, b->stream_id, &buf, NULL) < 0)
+	/* Block until a frame is ready.  The dqbuf `settings` output carries the
+	 * per-frame 3A results actually applied to this frame (AE exposure / ISO /
+	 * frame rate / AWB), which we forward to the plugin as metadata. */
+	if (camera_stream_dqbuf(b->camera_id, b->stream_id, &buf, &settings) < 0)
 		return -EIO;
+
+	metadata_capture(b, settings);
 
 		if (buf && dst && buf->addr) {
 			int copy = size;
@@ -1168,9 +1256,14 @@ int camhal_backend_dqbuf_index(struct camhal_backend *b,
 	if (!b || !b->running || !b->external || !out_index)
 		return -EINVAL;
 
-	/* Block until a frame lands in one of the direct-mode USERPTR buffers. */
-	if (camera_stream_dqbuf(b->camera_id, b->stream_id, &buf, NULL) < 0)
+	icamera::Parameters settings;
+
+	/* Block until a frame lands in one of the direct-mode USERPTR buffers.
+	 * Capture the per-frame 3A results via the dqbuf `settings` output. */
+	if (camera_stream_dqbuf(b->camera_id, b->stream_id, &buf, &settings) < 0)
 		return -EIO;
+
+	metadata_capture(b, settings);
 
 	if (buf->index < 0 || buf->index >= b->n_buffers) {
 		CAM_LOG_ERR(b, "camhal: dqbuf_index returned bad index %d (n=%d)",
@@ -1306,5 +1399,6 @@ void camhal_backend_destroy(struct camhal_backend *b)
 	hal_unref();
 	CAM_LOG_INFO(b, "camhal: DESTROY backend camera %d done (hal_unref)", b->camera_id);
 	pthread_mutex_destroy(&b->lock);
+	pthread_mutex_destroy(&b->meta_lock);
 	delete b;
 }

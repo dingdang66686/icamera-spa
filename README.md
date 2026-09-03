@@ -286,7 +286,11 @@ SPA_DEBUG=4 systemctl --user restart wireplumber
       HAL，支持 streaming 中动态修改。
 - [ ] **P1 — 多格式逐格式实测**: 在 HAL 实际支持多种格式的传感器上，逐格式验证
       枚举/协商/后端配置/打包搬运（当前机器传感器仅上报 NV12，已实测）。
-- [ ] **P1 — HAL metadata 透传**: 曝光/3A statistics 等 metadata 尚未透传到管线。
+- [x] **P1 — HAL metadata 透传**: 每帧从 HAL `Parameters` 采集 3A 结果
+      （AE state / exposure / ISO / fps / AWB state / AWB RGB 增益），经
+      `SPA_META_Control`（单条 `SPA_CONTROL_Properties`，value 为 `Props` 对象，
+      自定义 key 从 `SPA_PROP_START_CUSTOM` 起）随帧透传给下游。若协商时对端未
+      分配 Control meta，则优雅跳过、帧正常输出。
 
 ---
 

@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -53,6 +54,7 @@
 #include <spa/param/video/format.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/param/video/raw.h>
+#include <spa/control/control.h>
 #include <spa/pod/pod.h>
 #include <spa/pod/builder.h>
 #include <spa/pod/vararg.h>
@@ -196,6 +198,7 @@ struct frame {
 	struct spa_list link;
 	struct spa_buffer *outbuf;
 	struct spa_meta_header *h;
+	struct spa_meta_control *control; /* SPA_META_Control (3A) if present */
 };
 
 struct port {
@@ -1499,13 +1502,28 @@ next:
 		}
 		break;
 	case SPA_PARAM_Meta:
-		if (result.index > 0)
+		if (result.index > 1)
 			return 0;
-		param = spa_pod_builder_add_object(&b,
-			SPA_TYPE_OBJECT_ParamMeta, id,
-			SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
-			SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
-		break;
+		if (result.index == 0) {
+			struct spa_meta_header mh = { 0 };
+			param = spa_pod_builder_add_object(&b,
+				SPA_TYPE_OBJECT_ParamMeta, id,
+				SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
+				SPA_PARAM_META_size, SPA_POD_Int(sizeof(mh)));
+			break;
+		}
+		/* Second meta: a Control meta carrying per-frame 3A results
+		 * (AE exposure / ISO / frame rate / AWB) as a
+		 * SPA_CONTROL_Properties sequence.  Optional: consumers that do
+		 * not allocate it simply get no 3A metadata (we skip it). */
+		{
+			struct spa_meta_control mc = { { 0 } };
+			param = spa_pod_builder_add_object(&b,
+				SPA_TYPE_OBJECT_ParamMeta, id,
+				SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Control),
+				SPA_PARAM_META_size, SPA_POD_Int(sizeof(mc) + 128));
+			break;
+		}
 	case SPA_PARAM_IO:
 		if (result.index > 0)
 			return 0;
@@ -1811,6 +1829,9 @@ static int icamera_alloc_buffers(struct impl *impl, struct port *port,
 		frame->flags = 0;
 		frame->h = (struct spa_meta_header *)spa_buffer_find_meta_data(
 				buffers[i], SPA_META_Header, sizeof(*frame->h));
+		frame->control = (struct spa_meta_control *)spa_buffer_find_meta_data(
+				buffers[i], SPA_META_Control,
+				sizeof(*frame->control) + 128);
 		SPA_FLAG_SET(frame->flags, BUFFER_FLAG_OWNED);
 		frame->link.next = NULL;
 		frame->link.prev = NULL;
@@ -1894,6 +1915,9 @@ static int impl_node_port_use_buffers(void *object,
 		frame->flags = 0;
 		frame->h = (struct spa_meta_header *)spa_buffer_find_meta_data(
 				buffers[i], SPA_META_Header, sizeof(*frame->h));
+		frame->control = (struct spa_meta_control *)spa_buffer_find_meta_data(
+				buffers[i], SPA_META_Control,
+				sizeof(*frame->control) + 128);
 		frame->link.next = NULL;
 		frame->link.prev = NULL;
 	}
@@ -1974,6 +1998,83 @@ static int impl_node_port_reuse_buffer(void *object,
 	return 0;
 }
 
+/*
+ * Per-frame 3A metadata (custom props keys inside the SPA_META_Control /
+ * SPA_CONTROL_Properties sequence we advertise).  Custom key space starts at
+ * SPA_PROP_START_Custom; offsets below are stable within this plugin.
+ */
+enum {
+	ICAM_META_AE_STATE  = SPA_PROP_START_CUSTOM + 0, /* int  */
+	ICAM_META_EXPOSURE  = SPA_PROP_START_CUSTOM + 1, /* long, us */
+	ICAM_META_ISO       = SPA_PROP_START_CUSTOM + 2, /* int  */
+	ICAM_META_FPS       = SPA_PROP_START_CUSTOM + 3, /* float */
+	ICAM_META_AWB_R     = SPA_PROP_START_CUSTOM + 4, /* float r/g */
+	ICAM_META_AWB_G     = SPA_PROP_START_CUSTOM + 5, /* float g/g */
+	ICAM_META_AWB_B     = SPA_PROP_START_CUSTOM + 6, /* float b/g */
+};
+
+/*
+ * Fill the buffer's SPA_META_Control with the latest backend 3A results, if
+ * (a) the peer allocated a Control meta and (b) the backend has captured a
+ * frame's metadata yet.  Both are optional: when either is missing we skip
+ * writing and the frame still flows normally (just no 3A metadata).
+ */
+static void icamera_write_metadata(struct impl *impl, struct frame *frame)
+{
+	struct spa_meta_control *mc = frame->control;
+	struct camhal_metadata m;
+	struct spa_pod_builder b;
+	uint8_t tmp[256];
+	struct spa_pod_frame f_seq, f_obj;
+	struct spa_pod *res;
+	int have = camhal_backend_get_metadata(impl->backend, &m);
+
+	/* If the peer did not negotiate a Control meta, or the backend does not
+	 * have 3A values yet, there is nothing to publish. */
+	if (mc == NULL)
+		return;
+	if (have < 0 || !m.valid)
+		return;
+
+	/* Build a sequence with a single SPA_CONTROL_Properties control whose
+	 * value is a Props object carrying the 3A key/value pairs. */
+	spa_pod_builder_init(&b, tmp, sizeof(tmp));
+	spa_pod_builder_push_sequence(&b, &f_seq, 0);
+	spa_pod_builder_control(&b, 0, SPA_CONTROL_Properties);
+	spa_pod_builder_push_object(&b, &f_obj, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+	spa_pod_builder_prop(&b, ICAM_META_AE_STATE, 0);
+	spa_pod_builder_int(&b, m.ae_state);
+	spa_pod_builder_prop(&b, ICAM_META_EXPOSURE, 0);
+	spa_pod_builder_long(&b, m.exposure_us);
+	spa_pod_builder_prop(&b, ICAM_META_ISO, 0);
+	spa_pod_builder_int(&b, m.iso);
+	spa_pod_builder_prop(&b, ICAM_META_FPS, 0);
+	spa_pod_builder_float(&b, m.fps);
+	spa_pod_builder_prop(&b, ICAM_META_AWB_R, 0);
+	spa_pod_builder_float(&b, m.awb_r_per_g);
+	spa_pod_builder_prop(&b, ICAM_META_AWB_G, 0);
+	spa_pod_builder_float(&b, m.awb_g_per_g);
+	spa_pod_builder_prop(&b, ICAM_META_AWB_B, 0);
+	spa_pod_builder_float(&b, m.awb_b_per_g);
+	spa_pod_builder_pop(&b, &f_obj);
+	res = spa_pod_builder_pop(&b, &f_seq);
+	if (res == NULL)
+		return;
+
+	/* Only blit when it fits the Control meta area reserved at negotiate
+	 * time (meta.size accounts the whole spa_meta_control). */
+	if (SPA_POD_SIZE(res) <= mc->sequence.pod.size) {
+		memcpy(&mc->sequence, res, SPA_POD_SIZE(res));
+		ICAM_LOG_DEBUG(impl,
+			"icamera: 3A meta written ae=%d exp=%lldus iso=%d "
+			"fps=%.1f awb_state=%d rgb=(%.2f,%.2f,%.2f)",
+			m.ae_state, (long long)m.exposure_us, m.iso, m.fps,
+			m.awb_state, m.awb_r_per_g, m.awb_g_per_g, m.awb_b_per_g);
+	} else if (impl->log)
+		spa_log_debug(impl->log, "icamera: 3A meta too large (%u), skipped",
+			      SPA_POD_SIZE(res));
+}
+
 static int impl_node_process(void *object)
 {
 	struct impl *impl = object;
@@ -2020,6 +2121,10 @@ static int impl_node_process(void *object)
 		frame->h->pts = frame->pts;
 		frame->h->dts_offset = 0;
 	}
+
+	/* Attach per-frame 3A metadata (if the peer negotiated a Control meta
+	 * and the backend has captured metadata yet). */
+	icamera_write_metadata(impl, frame);
 
 	io->buffer_id = frame->id;
 	io->status = SPA_STATUS_HAVE_DATA;

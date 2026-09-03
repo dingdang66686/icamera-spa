@@ -200,6 +200,42 @@ int camhal_backend_dqbuf_index(struct camhal_backend *b,
 			       int *out_index, uint64_t *out_ts);
 
 /*
+ * Per-frame metadata snapshot filled from the HAL on every dqbuf.  The backend
+ * asks the HAL for the 3A results actually applied to the most recently
+ * dequeued frame (the dqbuf `Parameters` output) and caches them here so the
+ * plugin can forward them as PipeWire buffer metadata.
+ *
+ * `valid` is non-zero once at least one frame has been dequeued.  Field units
+ * follow the libcamhal Parameters API:
+ *   exposure_us   actual AE exposure time in microseconds
+ *   iso           actual sensor sensitivity (ISO) after AE
+ *   fps           actual frame rate derived from frame duration
+ *   ae_state      camera_ae_state_t (0 = NOT_CONVERGED, 1 = CONVERGED)
+ *   awb_state     camera_awb_state_t
+ *   awb_r/g/b_per_g  AWB channel gains relative to G
+ * A get of 0 / false values means the related field was not reported.
+ */
+struct camhal_metadata {
+	int      valid;          /* 1 once a frame's metadata has been captured */
+	int64_t  exposure_us;
+	int32_t  iso;
+	float    fps;
+	int32_t  ae_state;
+	int32_t  awb_state;
+	float    awb_r_per_g;
+	float    awb_g_per_g;
+	float    awb_b_per_g;
+};
+
+/*
+ * Return the metadata snapshot for the most recently dequeued frame.  Safe to
+ * call from any thread.  Returns 0 and fills *out on success; -EINVAL if args
+ * are NULL.  The snapshot may briefly lag the newest frame by one dq.
+ */
+int camhal_backend_get_metadata(struct camhal_backend *b,
+				struct camhal_metadata *out);
+
+/*
  * Hand a dequeued direct-mode buffer back to the HAL.  Call exactly once per
  * buffer returned by camhal_backend_dqbuf_index(), when the consumer is done
  * with it (in the SPA plugin: reuse_buffer).  Returns 0 on success.
