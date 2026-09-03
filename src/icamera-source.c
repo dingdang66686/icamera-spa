@@ -1521,9 +1521,6 @@ static int impl_node_port_set_param(void *object,
 	if (spa_format_video_raw_parse(param, &info.info.raw) < 0)
 		return -EINVAL;
 
-	if (info.info.raw.size.width == 0 || info.info.raw.size.height == 0)
-		return -EINVAL;
-
 	/* Accept any format we can map back to a V4L2 fourcc AND that the HAL
 	 * actually advertises for this camera (res[]), so we only ever negotiate
 	 * something the backend can really produce.  The HAL reports only NV12
@@ -1537,27 +1534,81 @@ static int impl_node_port_set_param(void *object,
 				"a V4L2 fourcc)", spa_fmt);
 		return -EINVAL;
 	}
-	for (i = 0; i < impl->n_res; i++) {
-		if (impl->res[i].format == fourcc &&
-		    impl->res[i].width == info.info.raw.size.width &&
-		    impl->res[i].height == info.info.raw.size.height)
-			break;
-	}
-	if (i >= impl->n_res) {
-		if (impl->log)
-			spa_log_warn(impl->log,
-				"icamera: reject fourcc=0x%x %ux%u (not in HAL "
-				"supported set)", fourcc,
-				info.info.raw.size.width, info.info.raw.size.height);
-		return -EINVAL;
-	}
 
-	port->format = fourcc;
-	port->width = info.info.raw.size.width;
-	port->height = info.info.raw.size.height;
-	port->data_size = v4l2_format_size(fourcc, port->width, port->height);
-	port->have_format = true;
-	return 0;
+	/*
+	 * Resolve the concrete (fourcc,size) we can actually produce.
+	 *
+	 * Auto-negotiating consumers (OBS, Firefox, gst pipewiresrc /
+	 * videoadapter) send a Format that may omit Video:size entirely
+	 * (i.e. 0x0) and leave the choice of resolution to the source.  A
+	 * strict exact-match against the HAL supported set rejects every one
+	 * of them (PipeWire surfaces this to the client as
+	 * "Format negotiation failed").  So instead:
+	 *   - if a size is given, accept the exact HAL mode, or best-effort
+	 *     map to the closest supported size of the requested fourcc;
+	 *   - if no size is given, use our preferred/default resolution.
+	 * Only when the fourcc maps to no HAL mode at all do we reject, so we
+	 * never claim to produce something the backend can't.
+	 */
+	{
+		uint32_t req_w = info.info.raw.size.width;
+		uint32_t req_h = info.info.raw.size.height;
+		int best = -1;
+		uint64_t best_delta = UINT64_MAX;
+
+		for (i = 0; i < impl->n_res; i++) {
+			if (impl->res[i].format != fourcc)
+				continue;
+
+			/* Exact match wins immediately. */
+			if (req_w != 0 && req_h != 0 &&
+			    impl->res[i].width == req_w &&
+			    impl->res[i].height == req_h) {
+				best = i;
+				best_delta = 0;
+				break;
+			}
+
+			if (req_w != 0 && req_h != 0) {
+				/* Track the closest size for a best-match. */
+				int64_t dw = (int64_t)impl->res[i].width - (int64_t)req_w;
+				int64_t dh = (int64_t)impl->res[i].height - (int64_t)req_h;
+				uint64_t delta =
+					(uint64_t)(dw * dw) + (uint64_t)(dh * dh);
+				if (delta < best_delta) {
+					best_delta = delta;
+					best = i;
+				}
+			} else if (best == -1) {
+				/* No size requested: default to the first mode
+				 * of this fourcc (usually the largest). */
+				best = i;
+			}
+		}
+
+		if (best < 0) {
+			if (impl->log)
+				spa_log_warn(impl->log,
+					"icamera: reject fourcc=0x%x (no HAL "
+					"mode for this pixel format)", fourcc);
+			return -EINVAL;
+		}
+
+		if (impl->log && (req_w != impl->res[best].width ||
+				  req_h != impl->res[best].height))
+			spa_log_warn(impl->log,
+				"icamera: map request %ux%u -> HAL %ux%u",
+				req_w, req_h,
+				impl->res[best].width, impl->res[best].height);
+
+		port->format = fourcc;
+		port->width = impl->res[best].width;
+		port->height = impl->res[best].height;
+		port->data_size = v4l2_format_size(fourcc,
+						  port->width, port->height);
+		port->have_format = true;
+		return 0;
+	}
 }
 
 /*
