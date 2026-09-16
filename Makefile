@@ -105,7 +105,7 @@ build/test-hal-dmabuf: test/test-hal-dmabuf.cpp build/camhal_backend.o
 	$(CXX) $(CXXFLAGS) -std=c++11 -o $@ test/test-hal-dmabuf.cpp build/camhal_backend.o -lpthread -ldl -ldrm_intel -ldrm
 
 .PHONY: clean install install-monitor test-hal-release test-hal-dmabuf \
-	test-pw-dmabuf-direct test-pw-dmabuf-consumer test-pw-reneg
+	test-pw-dmabuf-direct test-pw-dmabuf-consumer test-pw-reneg test-pw-props
 test-hal-release: build/test-hal-release
 test-hal-dmabuf: build/test-hal-dmabuf
 
@@ -133,6 +133,17 @@ build/test-pw-reneg: test/test-pw-reneg.c
 	$(CC) -O2 -g -Wall -Wextra -o $@ $< $(SPA_INCDIR)
 
 test-pw-reneg: build/test-pw-reneg
+
+# SPA Props/PropInfo contract test: dlopens the installed libspa-icamera.so and
+# asserts every advertised property id lives in a legal namespace, is wrapped
+# in a Choice pod, carries a description (and labels for enums), is advertised
+# identically on the node and port channels, appears in SPA_PARAM_Props, and
+# survives a set_param() round-trip.
+build/test-pw-props: test/test-pw-props.c
+	@mkdir -p build
+	$(CC) -O2 -g -Wall -Wextra -o $@ $< $(SPA_INCDIR)
+
+test-pw-props: build/test-pw-props
 clean:
 	rm -rf build
 

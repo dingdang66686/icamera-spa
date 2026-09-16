@@ -952,38 +952,26 @@ static int build_enum_format(struct impl *impl, struct spa_pod_builder *b,
 	return 0;
 }
 
-/* Does this port carry a negotiated Format yet?  Used for PropInfo of the
- * format family so we don't advertise an empty size/rate before negotiation. */
-static bool port_has_format(const struct port *port)
-{
-	return port->have_format;
-}
-
-/* Kind of a property we describe in PropInfo. */
-enum prop_kind {
-	PROP_INT,   /* spa_pod_int      */
-	PROP_LONG,  /* spa_pod_long     */
-	PROP_FLOAT, /* spa_pod_float    */
-	PROP_ID,    /* spa_pod_id       (an enum/pick)  */
-	PROP_RECT,  /* spa_pod_rectangle               */
-	PROP_FRAC,  /* spa_pod_fraction                */
-};
-
-/* Node-level property ids handed to clients through SPA_PROP_INFO_id.  OBS
+/* Property ids handed to clients through SPA_PROP_INFO_id.  OBS
  * (linux-pipewire camera-portal) uses this id as the object key when it
  * writes the control back via pw_node_set_param(SPA_PARAM_Props), so
- * impl_node_set_param() must map it back to the matching 3A field.  Values
- * sit in a private range to avoid colliding with standard SPA_PROP_* ids. */
+ * impl_node_set_param() must map it back to the matching 3A field.
+ *
+ * Exposure and gain reuse the standard SPA video property ids; everything
+ * else lives in SPA_PROP_START_CUSTOM, which is the range the SPA spec
+ * reserves for vendor properties.  (The old values 0x10000..0x10008 were
+ * wrong: that is SPA_PROP_START_Audio, the audio namespace, which is why
+ * generic consumers could not read them back.) */
 enum icamera_prop_id {
-	ICAMERA_PROP_AE_MODE    = 0x10000,
-	ICAMERA_PROP_EXPOSURE   = 0x10001,
-	ICAMERA_PROP_GAIN       = 0x10002,
-	ICAMERA_PROP_AWB_MODE   = 0x10003,
-	ICAMERA_PROP_AWB_R_GAIN = 0x10004,
-	ICAMERA_PROP_AWB_G_GAIN = 0x10005,
-	ICAMERA_PROP_AWB_B_GAIN = 0x10006,
-	ICAMERA_PROP_FRAME_RATE = 0x10007,
-	ICAMERA_PROP_3A_CADENCE = 0x10008,
+	ICAMERA_PROP_AE_MODE    = SPA_PROP_START_CUSTOM + 0,
+	ICAMERA_PROP_AWB_MODE   = SPA_PROP_START_CUSTOM + 1,
+	ICAMERA_PROP_AWB_R_GAIN = SPA_PROP_START_CUSTOM + 2,
+	ICAMERA_PROP_AWB_G_GAIN = SPA_PROP_START_CUSTOM + 3,
+	ICAMERA_PROP_AWB_B_GAIN = SPA_PROP_START_CUSTOM + 4,
+	ICAMERA_PROP_FRAME_RATE = SPA_PROP_START_CUSTOM + 5,
+	ICAMERA_PROP_3A_CADENCE = SPA_PROP_START_CUSTOM + 6,
+	ICAMERA_PROP_EXPOSURE   = SPA_PROP_exposure,
+	ICAMERA_PROP_GAIN       = SPA_PROP_gain,
 };
 
 /* camera_awb_mode_t values (libcamhal Parameters.h).  Referenced numerically
@@ -996,117 +984,6 @@ enum {
 	AWB_MODE_MANUAL_GAIN      = 10,
 };
 
-/* Build the "(name, type, description)" of one property as an
- * SPA_TYPE_OBJECT_PropInfo result.  Returns 0 and sets *out on success,
- * or -ENOENT when idx has walked past the end of the property table (which
- * tells the caller to stop enumerating).
- *
- * These are the properties a client can actually observe or tune on this
- * icamera port:
- *   - the api.icamera.* 3A knobs, exposed read/write through the node-level
- *     Props::params channel (marked params=1 so tooling knows they belong to
- *     that channel);
- *   - the negotiated output format family (format / video.size /
- *     video.framerate), reflecting what the port is currently producing.
- * This makes SPA_PARAM_PropInfo enumerable end-to-end (previously the port
- * param table claimed READ but the enum switch had no PropInfo branch, so
- * every read fell through to -ENOENT).
- */
-static int build_port_propinfo(struct impl *impl, struct port *port,
-			       struct spa_pod_builder *b, int idx,
-			       struct spa_pod **out)
-{
-	(void)impl;
-#define MAX_PORT_PROPS 12
-	static const struct {
-		const char *name;
-		const char *desc;
-		enum prop_kind kind;
-		bool in_params;
-	} tab[MAX_PORT_PROPS] = {
-		{ "api.icamera.ae-mode",     "AE mode (0=auto,1=manual)",   PROP_INT,   true },
-		{ "api.icamera.exposure",     "exposure time (ns)",          PROP_LONG,  true },
-		{ "api.icamera.gain",         "analog gain",                 PROP_FLOAT, true },
-		{ "api.icamera.awb-mode",     "AWB mode (0=auto,1=manual)",  PROP_INT,   true },
-		{ "api.icamera.awb-r-gain",   "AWB red gain",                PROP_INT,   true },
-		{ "api.icamera.awb-g-gain",   "AWB green gain",              PROP_INT,   true },
-		{ "api.icamera.awb-b-gain",   "AWB blue gain",               PROP_INT,   true },
-		{ "api.icamera.frame-rate",   "target frame rate (fps)",     PROP_FLOAT, true },
-		{ "api.icamera.3a-cadence",   "3A run cadence",              PROP_INT,   true },
-		{ "format",                   "negotiated video format",     PROP_ID,    false },
-		{ "video.size",               "negotiated frame size",       PROP_RECT,  false },
-		{ "video.framerate",          "negotiated frame rate",       PROP_FRAC,  false },
-	};
-	/* NOTE: SPA_POD_*(val) (pod/vararg.h) expand to "<fmt-tag>", val
-	 * pairs intended to be spliced directly into the varargs of
-	 * spa_pod_builder_add_object().  They must NOT be captured into a
-	 * variable (that would treat the fmt string as a pod pointer and
-	 * crash).  Because the property type tag differs per kind, build
-	 * each object inline in its own branch. */
-	int n = (int)(sizeof(tab) / sizeof(tab[0]));
-
-	if (idx < 0 || idx >= n)
-		return -ENOENT;
-
-	if (!port_has_format(port) && tab[idx].in_params == false)
-		return -ENOENT; /* no format negotiated yet: skip format props */
-
-	switch (tab[idx].kind) {
-	case PROP_INT:
-		*out = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
-			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
-			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
-			SPA_PROP_INFO_type,        SPA_POD_Int(0),
-			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
-		break;
-	case PROP_LONG:
-		*out = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
-			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
-			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
-			SPA_PROP_INFO_type,        SPA_POD_Long(0),
-			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
-		break;
-	case PROP_FLOAT:
-		*out = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
-			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
-			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
-			SPA_PROP_INFO_type,        SPA_POD_Float(0.0f),
-			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
-		break;
-	case PROP_ID:
-		*out = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
-			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
-			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
-			SPA_PROP_INFO_type,        SPA_POD_Id(0),
-			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
-		break;
-	case PROP_RECT:
-		*out = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
-			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
-			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
-			SPA_PROP_INFO_type,        SPA_POD_Rectangle(&SPA_RECTANGLE(0, 0)),
-			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
-		break;
-	case PROP_FRAC:
-		*out = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
-			SPA_PROP_INFO_name,        SPA_POD_String(tab[idx].name),
-			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc),
-			SPA_PROP_INFO_type,        SPA_POD_Fraction(&SPA_FRACTION(0, 1)),
-			SPA_PROP_INFO_params,      SPA_POD_Bool(tab[idx].in_params));
-		break;
-	default:
-		return -EINVAL;
-	}
-	return 0;
-#undef MAX_PORT_PROPS
-}
-
 /* Kind of a node-level tunable control we expose via PropInfo. */
 enum ictrl_kind {
 	ICTRL_ENUM_INT,     /* Int + Enum choice + labels -> dropdown     */
@@ -1114,36 +991,41 @@ enum ictrl_kind {
 	ICTRL_SLIDER_FLOAT, /* Float + Range choice        -> float slider */
 };
 
-/* Build the PropInfo description of a tunable icamera 3A control, returned
- * through the NODE-level SPA_PARAM_PropInfo channel (which is the only
- * channel OBS's camera-portal enumerates).
+/* Build the PropInfo description of a tunable icamera 3A control.
  *
- * OBS add_control_property() is picky about the shape it accepts, so this is
- * deliberately written to match it:
+ * This is the single source of truth for the controls and is served on BOTH
+ * the node- and port-level SPA_PARAM_PropInfo channels (the v4l2 SPA plugin
+ * does the same).  OBS's camera-portal only enumerates the node channel, but
+ * keeping the port channel identical means any consumer sees the same set.
+ *
+ * The shape follows the SPA spec / v4l2 reference implementation exactly:
  *   - SPA_PROP_INFO_id          -> SPA_POD_Id          ; becomes the Props
  *                                object key on write-back and the dropdown
  *                                list value.
- *   - SPA_PROP_INFO_description -> SPA_POD_String      ; becomes the control
- *                                name shown in the UI.
  *   - SPA_PROP_INFO_type        -> SPA_POD_PodChoice   ; a Choice pod (Range
  *                                for sliders, Enum for dropdowns).
  *   - SPA_PROP_INFO_labels      -> Struct(Int,String)* ; Enum controls only.
+ *   - SPA_PROP_INFO_description -> SPA_POD_String      ; the control name
+ *                                shown in the UI (NOT SPA_PROP_INFO_name,
+ *                                which OBS ignores).
+ * Fields are pushed in ascending key order, as the SPA POD docs recommend.
  * OBS switches on the (unwrapped) pod type and only handles Int, Bool and
- * Float -- anything else (e.g. Long) is silently dropped -- so every control
- * below is Int or Float.  Exposure is carried in milliseconds as a Float and
- * converted back to ns on write.  Min/max/default are taken from the live 3A
- * state so the enum reflects reality. */
+ * Float -- anything else (e.g. Long/Id) is silently dropped -- so every
+ * control below is Int or Float.  Exposure is carried in microseconds as an
+ * Int because that is the type SPA registers for SPA_PROP_exposure in
+ * spa/param/props-types.h; it is converted back to ns on write.  Min/max/
+ * default are taken from the live 3A state so the enum reflects reality. */
 static int build_node_propinfo(struct impl *impl, struct spa_pod_builder *b,
 			       int idx, struct spa_pod **out)
 {
 #define N_NODE_PROPS 9
 	static const struct {
-		const char *name;
+		const char *desc;
 		enum ictrl_kind kind;
 		uint32_t id;
 	} tab[N_NODE_PROPS] = {
 		{ "AE Mode",                ICTRL_ENUM_INT,     ICAMERA_PROP_AE_MODE    },
-		{ "Exposure (ms)",          ICTRL_SLIDER_FLOAT, ICAMERA_PROP_EXPOSURE   },
+		{ "Exposure (us)",          ICTRL_SLIDER_INT,   ICAMERA_PROP_EXPOSURE   },
 		{ "Gain (ISO)",             ICTRL_SLIDER_FLOAT, ICAMERA_PROP_GAIN       },
 		{ "AWB Mode",               ICTRL_ENUM_INT,     ICAMERA_PROP_AWB_MODE   },
 		{ "AWB R Gain",             ICTRL_SLIDER_INT,   ICAMERA_PROP_AWB_R_GAIN },
@@ -1170,10 +1052,10 @@ static int build_node_propinfo(struct impl *impl, struct spa_pod_builder *b,
 			*out = spa_pod_builder_add_object(b,
 				SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
 				SPA_PROP_INFO_id,          SPA_POD_Id(tab[idx].id),
-				SPA_PROP_INFO_description, SPA_POD_String(tab[idx].name),
 				SPA_PROP_INFO_type,        SPA_POD_CHOICE_ENUM_Int(
 					3, impl->s3a.ae_mode, 0, 1),
-				SPA_PROP_INFO_labels,      SPA_POD_PodStruct(labels_pod));
+				SPA_PROP_INFO_labels,      SPA_POD_PodStruct(labels_pod),
+				SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc));
 		} else {
 			/* AWB mode (camera_awb_mode_t) */
 			struct spa_pod_frame sf;
@@ -1189,18 +1071,22 @@ static int build_node_propinfo(struct impl *impl, struct spa_pod_builder *b,
 			*out = spa_pod_builder_add_object(b,
 				SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
 				SPA_PROP_INFO_id,          SPA_POD_Id(tab[idx].id),
-				SPA_PROP_INFO_description, SPA_POD_String(tab[idx].name),
 				SPA_PROP_INFO_type,        SPA_POD_CHOICE_ENUM_Int(
 					6, impl->s3a.awb_mode,
 					AWB_MODE_AUTO, AWB_MODE_INCANDESCENT,
 					AWB_MODE_FLUORESCENT, AWB_MODE_DAYLIGHT,
 					AWB_MODE_MANUAL_GAIN),
-				SPA_PROP_INFO_labels,      SPA_POD_PodStruct(labels_pod));
+				SPA_PROP_INFO_labels,      SPA_POD_PodStruct(labels_pod),
+				SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc));
 		}
 		break;
 	case ICTRL_SLIDER_INT: {
 		int32_t def = 0, min = 0, max = 0;
 		switch (tab[idx].id) {
+		case ICAMERA_PROP_EXPOSURE:
+			/* s3a.exposure_time is ns; expose in microseconds */
+			def = (int32_t)(impl->s3a.exposure_time / 1000);
+			min = 1; max = 1000000; break;
 		case ICAMERA_PROP_AWB_R_GAIN:
 			def = impl->s3a.awb_r_gain; min = 0; max = 4096; break;
 		case ICAMERA_PROP_AWB_G_GAIN:
@@ -1213,18 +1099,13 @@ static int build_node_propinfo(struct impl *impl, struct spa_pod_builder *b,
 		*out = spa_pod_builder_add_object(b,
 			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
 			SPA_PROP_INFO_id,          SPA_POD_Id(tab[idx].id),
-			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].name),
-			SPA_PROP_INFO_type,        SPA_POD_CHOICE_RANGE_Int(def, min, max));
+			SPA_PROP_INFO_type,        SPA_POD_CHOICE_RANGE_Int(def, min, max),
+			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc));
 		break;
 	}
 	case ICTRL_SLIDER_FLOAT: {
 		float def, min, max;
 		switch (tab[idx].id) {
-		case ICAMERA_PROP_EXPOSURE:
-			/* s3a.exposure_time is ns; expose in ms */
-			def = impl->s3a.exposure_time > 0 ?
-				(float)(impl->s3a.exposure_time / 1000000) : 16.666f;
-			min = 0.1f; max = 1000.0f; break;
 		case ICAMERA_PROP_GAIN:
 			def = impl->s3a.gain > 0.0f ? impl->s3a.gain : 100.0f;
 			min = 1.0f; max = 6400.0f; break;
@@ -1237,8 +1118,8 @@ static int build_node_propinfo(struct impl *impl, struct spa_pod_builder *b,
 		*out = spa_pod_builder_add_object(b,
 			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
 			SPA_PROP_INFO_id,          SPA_POD_Id(tab[idx].id),
-			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].name),
-			SPA_PROP_INFO_type,        SPA_POD_CHOICE_RANGE_Float(def, min, max));
+			SPA_PROP_INFO_type,        SPA_POD_CHOICE_RANGE_Float(def, min, max),
+			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].desc));
 		break;
 	}
 	default:
@@ -1306,10 +1187,24 @@ next:
 			0);
 		params_sub = spa_pod_builder_pop(&b, &f);
 
+		/* Emit each control keyed by the id advertised in PropInfo (so a
+		 * consumer can read the current value straight out of Props), plus
+		 * the string-keyed SPA_PROP_params channel.  Keys are in ascending
+		 * order: live < exposure/gain < params < custom. */
 		param = spa_pod_builder_add_object(&b,
 			SPA_TYPE_OBJECT_Props, id,
-			SPA_PROP_live,     SPA_POD_Bool(true),
-			SPA_PROP_params,   SPA_POD_PodStruct(params_sub));
+			SPA_PROP_live,           SPA_POD_Bool(true),
+			ICAMERA_PROP_EXPOSURE,   SPA_POD_Int(
+				(int32_t)(impl->s3a.exposure_time / 1000)),
+			ICAMERA_PROP_GAIN,       SPA_POD_Float(impl->s3a.gain),
+			SPA_PROP_params,         SPA_POD_PodStruct(params_sub),
+			ICAMERA_PROP_AE_MODE,    SPA_POD_Int(impl->s3a.ae_mode),
+			ICAMERA_PROP_AWB_MODE,   SPA_POD_Int(impl->s3a.awb_mode),
+			ICAMERA_PROP_AWB_R_GAIN, SPA_POD_Int(impl->s3a.awb_r_gain),
+			ICAMERA_PROP_AWB_G_GAIN, SPA_POD_Int(impl->s3a.awb_g_gain),
+			ICAMERA_PROP_AWB_B_GAIN, SPA_POD_Int(impl->s3a.awb_b_gain),
+			ICAMERA_PROP_FRAME_RATE, SPA_POD_Float(impl->s3a.frame_rate),
+			ICAMERA_PROP_3A_CADENCE, SPA_POD_Int(impl->s3a.run_3a_cadence));
 		break;
 	}
 	case SPA_PARAM_EnumFormat:
@@ -1404,10 +1299,10 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 			changed = 1;
 			continue;
 		} else if (prop->key == ICAMERA_PROP_EXPOSURE &&
-			   SPA_POD_TYPE(&prop->value) == SPA_TYPE_Float) {
-			/* advertised in ms -> store ns */
+			   SPA_POD_TYPE(&prop->value) == SPA_TYPE_Int) {
+			/* advertised in microseconds -> store ns */
 			impl->s3a.exposure_time =
-				(int64_t)(SPA_POD_VALUE(struct spa_pod_float, &prop->value) * 1000000.0f);
+				(int64_t)SPA_POD_VALUE(struct spa_pod_int, &prop->value) * 1000;
 			impl->s3a.apply_exposure = 1;
 			changed = 1;
 			continue;
@@ -1661,10 +1556,12 @@ next:
 
 	switch (id) {
 	case SPA_PARAM_PropInfo:
-		/* Complete description of the tunable/exposed properties on this
-		 * port.  index walks the property table; -ENOENT stops the enum. */
+		/* The tunable 3A controls are exposed on both the node and the port
+		 * channel (the v4l2 SPA plugin does the same), so a consumer that
+		 * only enumerates port params still finds them.  The table lives in
+		 * build_node_propinfo(); -ENOENT stops the enum. */
 		{
-			int rr = build_port_propinfo(impl, port, &b, result.index, &param);
+			int rr = build_node_propinfo(impl, &b, result.index, &param);
 			if (rr < 0)
 				return 0;
 		}
