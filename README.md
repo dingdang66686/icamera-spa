@@ -121,9 +121,10 @@ sudo make install-monitor
 - monitor 脚本 → `/usr/share/wireplumber/scripts/monitors/icamera/`
 - drop-in 配置 → `/usr/share/wireplumber/wireplumber.conf.d/51-icamera.conf`
 
-**注意**: `51-icamera.conf` 默认会**禁用 v4l2 和 libcamera 视频相机 monitor**，
-让桌面只看到 icamera 源。如果你的系统有其他需要 v4l2/libcamera 相机的应用,
-请编辑该文件, 把 `main` profile 里的禁用项去掉。
+该配置只注册 icamera factory / monitor，**不干预** v4l2 和 libcamera 的
+monitor，它们仍由 WirePlumber 默认 profile 正常加载。三种相机源会同时出现，
+应用自行选择。若确实需要隐藏 v4l2/libcamera 源，可在
+`~/.config/wireplumber/wireplumber.conf.d/` 下自行加 profile 覆盖。
 
 ### 3) 重启 WirePlumber
 
