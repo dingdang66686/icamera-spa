@@ -241,7 +241,7 @@ struct impl {
 #define NODE_Props       0
 #define NODE_EnumFormat  1
 #define NODE_Format      2
-#define N_NODE_PARAMS    3
+#define N_NODE_PARAMS    4
 	struct spa_param_info params_node[N_NODE_PARAMS];
 
 	/* Dynamic per-instance node info props: media.category, an explicit
@@ -897,18 +897,27 @@ static int build_enum_format(struct impl *impl, struct spa_pod_builder *b,
 	if (spa_fmt == SPA_VIDEO_FORMAT_UNKNOWN)
 		return -ENOENT;
 
+	/* NOTE on encoding: each EnumFormat entry advertises exactly one fixed
+	 * (size, framerate).  We must encode both as a single (SPA_CHOICE_None)
+	 * pod rather than a SPA_CHOICE_Range range.
+	 *
+	 *   - OBS linux-pipewire camera-portal parses SPA_FORMAT_VIDEO_size with
+	 *     spa_pod_parse_object(..., SPA_POD_Rectangle).  That only succeeds
+	 *     for a plain Rectangle; a Choice(Range) pod makes it bail out and
+	 *     the whole format entry gets skipped (empty Video Format dropdown).
+	 *   - OBS framerate_list() explicitly rejects SPA_CHOICE_Range
+	 *     ("Ranged framerates not supported") and only accepts None/Enum,
+	 *     so Range would leave the framerate dropdown empty too.
+	 * GStreamer/pipewiresrc and PipeWire negotiation accept a plain
+	 * Fraction/Rectangle equally well, so nothing downstream is lost. */
 	*out = spa_pod_builder_add_object(b,
 		SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
 		SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
 		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
 		SPA_FORMAT_VIDEO_format, SPA_POD_Id(spa_fmt),
-		SPA_FORMAT_VIDEO_size,   SPA_POD_CHOICE_RANGE_Rectangle(
-			&SPA_RECTANGLE(impl->res[idx].width, impl->res[idx].height),
-			&SPA_RECTANGLE(impl->res[idx].width, impl->res[idx].height),
+		SPA_FORMAT_VIDEO_size,   SPA_POD_Rectangle(
 			&SPA_RECTANGLE(impl->res[idx].width, impl->res[idx].height)),
-		SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-			&impl->out_framerate, &impl->out_framerate,
-			&impl->out_framerate));
+		SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&impl->out_framerate));
 	return 0;
 }
 
@@ -927,6 +936,33 @@ enum prop_kind {
 	PROP_ID,    /* spa_pod_id       (an enum/pick)  */
 	PROP_RECT,  /* spa_pod_rectangle               */
 	PROP_FRAC,  /* spa_pod_fraction                */
+};
+
+/* Node-level property ids handed to clients through SPA_PROP_INFO_id.  OBS
+ * (linux-pipewire camera-portal) uses this id as the object key when it
+ * writes the control back via pw_node_set_param(SPA_PARAM_Props), so
+ * impl_node_set_param() must map it back to the matching 3A field.  Values
+ * sit in a private range to avoid colliding with standard SPA_PROP_* ids. */
+enum icamera_prop_id {
+	ICAMERA_PROP_AE_MODE    = 0x10000,
+	ICAMERA_PROP_EXPOSURE   = 0x10001,
+	ICAMERA_PROP_GAIN       = 0x10002,
+	ICAMERA_PROP_AWB_MODE   = 0x10003,
+	ICAMERA_PROP_AWB_R_GAIN = 0x10004,
+	ICAMERA_PROP_AWB_G_GAIN = 0x10005,
+	ICAMERA_PROP_AWB_B_GAIN = 0x10006,
+	ICAMERA_PROP_FRAME_RATE = 0x10007,
+	ICAMERA_PROP_3A_CADENCE = 0x10008,
+};
+
+/* camera_awb_mode_t values (libcamhal Parameters.h).  Referenced numerically
+ * here because the libcamhal C++ headers are not included by the SPA node. */
+enum {
+	AWB_MODE_AUTO             = 0,
+	AWB_MODE_INCANDESCENT     = 1,
+	AWB_MODE_FLUORESCENT      = 2,
+	AWB_MODE_DAYLIGHT         = 3,
+	AWB_MODE_MANUAL_GAIN      = 10,
 };
 
 /* Build the "(name, type, description)" of one property as an
@@ -1040,6 +1076,147 @@ static int build_port_propinfo(struct impl *impl, struct port *port,
 #undef MAX_PORT_PROPS
 }
 
+/* Kind of a node-level tunable control we expose via PropInfo. */
+enum ictrl_kind {
+	ICTRL_ENUM_INT,     /* Int + Enum choice + labels -> dropdown     */
+	ICTRL_SLIDER_INT,   /* Int + Range choice          -> int slider  */
+	ICTRL_SLIDER_FLOAT, /* Float + Range choice        -> float slider */
+};
+
+/* Build the PropInfo description of a tunable icamera 3A control, returned
+ * through the NODE-level SPA_PARAM_PropInfo channel (which is the only
+ * channel OBS's camera-portal enumerates).
+ *
+ * OBS add_control_property() is picky about the shape it accepts, so this is
+ * deliberately written to match it:
+ *   - SPA_PROP_INFO_id          -> SPA_POD_Id          ; becomes the Props
+ *                                object key on write-back and the dropdown
+ *                                list value.
+ *   - SPA_PROP_INFO_description -> SPA_POD_String      ; becomes the control
+ *                                name shown in the UI.
+ *   - SPA_PROP_INFO_type        -> SPA_POD_PodChoice   ; a Choice pod (Range
+ *                                for sliders, Enum for dropdowns).
+ *   - SPA_PROP_INFO_labels      -> Struct(Int,String)* ; Enum controls only.
+ * OBS switches on the (unwrapped) pod type and only handles Int, Bool and
+ * Float -- anything else (e.g. Long) is silently dropped -- so every control
+ * below is Int or Float.  Exposure is carried in milliseconds as a Float and
+ * converted back to ns on write.  Min/max/default are taken from the live 3A
+ * state so the enum reflects reality. */
+static int build_node_propinfo(struct impl *impl, struct spa_pod_builder *b,
+			       int idx, struct spa_pod **out)
+{
+#define N_NODE_PROPS 9
+	static const struct {
+		const char *name;
+		enum ictrl_kind kind;
+		uint32_t id;
+	} tab[N_NODE_PROPS] = {
+		{ "AE Mode",                ICTRL_ENUM_INT,     ICAMERA_PROP_AE_MODE    },
+		{ "Exposure (ms)",          ICTRL_SLIDER_FLOAT, ICAMERA_PROP_EXPOSURE   },
+		{ "Gain (ISO)",             ICTRL_SLIDER_FLOAT, ICAMERA_PROP_GAIN       },
+		{ "AWB Mode",               ICTRL_ENUM_INT,     ICAMERA_PROP_AWB_MODE   },
+		{ "AWB R Gain",             ICTRL_SLIDER_INT,   ICAMERA_PROP_AWB_R_GAIN },
+		{ "AWB G Gain",             ICTRL_SLIDER_INT,   ICAMERA_PROP_AWB_G_GAIN },
+		{ "AWB B Gain",             ICTRL_SLIDER_INT,   ICAMERA_PROP_AWB_B_GAIN },
+		{ "Frame Rate (fps)",       ICTRL_SLIDER_FLOAT, ICAMERA_PROP_FRAME_RATE },
+		{ "3A Cadence",             ICTRL_SLIDER_INT,   ICAMERA_PROP_3A_CADENCE },
+	};
+
+	if (idx < 0 || idx >= N_NODE_PROPS)
+		return -ENOENT;
+
+	switch (tab[idx].kind) {
+	case ICTRL_ENUM_INT:
+		if (tab[idx].id == ICAMERA_PROP_AE_MODE) {
+			/* AE mode: 0=Auto, 1=Manual (see camhal_3a_settings) */
+			struct spa_pod_frame sf;
+			struct spa_pod *labels_pod;
+			spa_pod_builder_push_struct(b, &sf);
+			spa_pod_builder_add(b,
+				SPA_POD_Int(0), SPA_POD_String("Auto"),
+				SPA_POD_Int(1), SPA_POD_String("Manual"), 0);
+			labels_pod = spa_pod_builder_pop(b, &sf);
+			*out = spa_pod_builder_add_object(b,
+				SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
+				SPA_PROP_INFO_id,          SPA_POD_Id(tab[idx].id),
+				SPA_PROP_INFO_description, SPA_POD_String(tab[idx].name),
+				SPA_PROP_INFO_type,        SPA_POD_CHOICE_ENUM_Int(
+					3, impl->s3a.ae_mode, 0, 1),
+				SPA_PROP_INFO_labels,      SPA_POD_PodStruct(labels_pod));
+		} else {
+			/* AWB mode (camera_awb_mode_t) */
+			struct spa_pod_frame sf;
+			struct spa_pod *labels_pod;
+			spa_pod_builder_push_struct(b, &sf);
+			spa_pod_builder_add(b,
+				SPA_POD_Int(AWB_MODE_AUTO),             SPA_POD_String("Auto"),
+				SPA_POD_Int(AWB_MODE_INCANDESCENT),     SPA_POD_String("Incandescent"),
+				SPA_POD_Int(AWB_MODE_FLUORESCENT),      SPA_POD_String("Fluorescent"),
+				SPA_POD_Int(AWB_MODE_DAYLIGHT),         SPA_POD_String("Daylight"),
+				SPA_POD_Int(AWB_MODE_MANUAL_GAIN),      SPA_POD_String("Manual Gain"), 0);
+			labels_pod = spa_pod_builder_pop(b, &sf);
+			*out = spa_pod_builder_add_object(b,
+				SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
+				SPA_PROP_INFO_id,          SPA_POD_Id(tab[idx].id),
+				SPA_PROP_INFO_description, SPA_POD_String(tab[idx].name),
+				SPA_PROP_INFO_type,        SPA_POD_CHOICE_ENUM_Int(
+					6, impl->s3a.awb_mode,
+					AWB_MODE_AUTO, AWB_MODE_INCANDESCENT,
+					AWB_MODE_FLUORESCENT, AWB_MODE_DAYLIGHT,
+					AWB_MODE_MANUAL_GAIN),
+				SPA_PROP_INFO_labels,      SPA_POD_PodStruct(labels_pod));
+		}
+		break;
+	case ICTRL_SLIDER_INT: {
+		int32_t def = 0, min = 0, max = 0;
+		switch (tab[idx].id) {
+		case ICAMERA_PROP_AWB_R_GAIN:
+			def = impl->s3a.awb_r_gain; min = 0; max = 4096; break;
+		case ICAMERA_PROP_AWB_G_GAIN:
+			def = impl->s3a.awb_g_gain; min = 0; max = 4096; break;
+		case ICAMERA_PROP_AWB_B_GAIN:
+			def = impl->s3a.awb_b_gain; min = 0; max = 4096; break;
+		case ICAMERA_PROP_3A_CADENCE:
+			def = impl->s3a.run_3a_cadence; min = 1; max = 20; break;
+		}
+		*out = spa_pod_builder_add_object(b,
+			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
+			SPA_PROP_INFO_id,          SPA_POD_Id(tab[idx].id),
+			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].name),
+			SPA_PROP_INFO_type,        SPA_POD_CHOICE_RANGE_Int(def, min, max));
+		break;
+	}
+	case ICTRL_SLIDER_FLOAT: {
+		float def, min, max;
+		switch (tab[idx].id) {
+		case ICAMERA_PROP_EXPOSURE:
+			/* s3a.exposure_time is ns; expose in ms */
+			def = impl->s3a.exposure_time > 0 ?
+				(float)(impl->s3a.exposure_time / 1000000) : 16.666f;
+			min = 0.1f; max = 1000.0f; break;
+		case ICAMERA_PROP_GAIN:
+			def = impl->s3a.gain > 0.0f ? impl->s3a.gain : 100.0f;
+			min = 1.0f; max = 6400.0f; break;
+		case ICAMERA_PROP_FRAME_RATE:
+			def = impl->s3a.frame_rate > 0.0f ? impl->s3a.frame_rate : 30.0f;
+			min = 1.0f; max = 120.0f; break;
+		default:
+			def = 0.0f; min = 0.0f; max = 0.0f; break;
+		}
+		*out = spa_pod_builder_add_object(b,
+			SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo,
+			SPA_PROP_INFO_id,          SPA_POD_Id(tab[idx].id),
+			SPA_PROP_INFO_description, SPA_POD_String(tab[idx].name),
+			SPA_PROP_INFO_type,        SPA_POD_CHOICE_RANGE_Float(def, min, max));
+		break;
+	}
+	default:
+		return -EINVAL;
+	}
+	return 0;
+#undef N_NODE_PROPS
+}
+
 static int impl_node_enum_params(void *object, int seq,
 				 uint32_t id, uint32_t start, uint32_t num,
 				 const struct spa_pod *filter)
@@ -1113,6 +1290,14 @@ next:
 		if (res < 0)
 			return 0;
 		break;
+	case SPA_PARAM_PropInfo:
+		/* Node-level description of the tunable 3A controls.  OBS only
+		 * enumerates node params, so this is what fills its "Camera
+		 * Controls" panel. */
+		res = build_node_propinfo(impl, &b, result.index, &param);
+		if (res < 0)
+			return 0;
+		break;
 	case SPA_PARAM_Format:
 		if (!impl->out_port.have_format)
 			return -EIO;
@@ -1160,12 +1345,71 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 	    SPA_POD_OBJECT_TYPE(param) != SPA_TYPE_OBJECT_Props)
 		return -EINVAL;
 
-	/* Parse the SPA_PROP_params channel: Struct((String:key, Pod:value)*).
-	 * Each key mirrors an init-time icamera.* property and updates the
-	 * corresponding 3A field live, without a node restart. */
+	/* Accept two write formats:
+	 *   1. the SPA_PROP_params channel: Struct((String:key, Pod:value)*)
+	 *      with keys mirroring the init-time icamera.* properties;
+	 *   2. OBS camera-portal style: a direct object property per control,
+	 *      where prop->key is the ICAMERA_PROP_* id advertised via
+	 *      SPA_PROP_INFO_id and the value is the control's new value.
+	 * Both update the corresponding 3A field live, without a restart. */
 	SPA_POD_OBJECT_FOREACH((struct spa_pod_object *)param, prop) {
 		const struct spa_pod *p;
 		const char *key = NULL;
+
+		if (prop->key == ICAMERA_PROP_AE_MODE &&
+		    SPA_POD_TYPE(&prop->value) == SPA_TYPE_Int) {
+			impl->s3a.ae_mode = SPA_POD_VALUE(struct spa_pod_int, &prop->value);
+			changed = 1;
+			continue;
+		} else if (prop->key == ICAMERA_PROP_AWB_MODE &&
+			   SPA_POD_TYPE(&prop->value) == SPA_TYPE_Int) {
+			impl->s3a.awb_mode = SPA_POD_VALUE(struct spa_pod_int, &prop->value);
+			changed = 1;
+			continue;
+		} else if (prop->key == ICAMERA_PROP_GAIN &&
+			   SPA_POD_TYPE(&prop->value) == SPA_TYPE_Float) {
+			impl->s3a.gain = SPA_POD_VALUE(struct spa_pod_float, &prop->value);
+			impl->s3a.apply_gain = 1;
+			changed = 1;
+			continue;
+		} else if (prop->key == ICAMERA_PROP_EXPOSURE &&
+			   SPA_POD_TYPE(&prop->value) == SPA_TYPE_Float) {
+			/* advertised in ms -> store ns */
+			impl->s3a.exposure_time =
+				(int64_t)(SPA_POD_VALUE(struct spa_pod_float, &prop->value) * 1000000.0f);
+			impl->s3a.apply_exposure = 1;
+			changed = 1;
+			continue;
+		} else if (prop->key == ICAMERA_PROP_AWB_R_GAIN &&
+			   SPA_POD_TYPE(&prop->value) == SPA_TYPE_Int) {
+			impl->s3a.awb_r_gain = SPA_POD_VALUE(struct spa_pod_int, &prop->value);
+			impl->s3a.apply_awb_gains = 1;
+			changed = 1;
+			continue;
+		} else if (prop->key == ICAMERA_PROP_AWB_G_GAIN &&
+			   SPA_POD_TYPE(&prop->value) == SPA_TYPE_Int) {
+			impl->s3a.awb_g_gain = SPA_POD_VALUE(struct spa_pod_int, &prop->value);
+			impl->s3a.apply_awb_gains = 1;
+			changed = 1;
+			continue;
+		} else if (prop->key == ICAMERA_PROP_AWB_B_GAIN &&
+			   SPA_POD_TYPE(&prop->value) == SPA_TYPE_Int) {
+			impl->s3a.awb_b_gain = SPA_POD_VALUE(struct spa_pod_int, &prop->value);
+			impl->s3a.apply_awb_gains = 1;
+			changed = 1;
+			continue;
+		} else if (prop->key == ICAMERA_PROP_FRAME_RATE &&
+			   SPA_POD_TYPE(&prop->value) == SPA_TYPE_Float) {
+			impl->s3a.frame_rate = SPA_POD_VALUE(struct spa_pod_float, &prop->value);
+			icamera_update_framerate(impl);
+			changed = 1;
+			continue;
+		} else if (prop->key == ICAMERA_PROP_3A_CADENCE &&
+			   SPA_POD_TYPE(&prop->value) == SPA_TYPE_Int) {
+			impl->s3a.run_3a_cadence = SPA_POD_VALUE(struct spa_pod_int, &prop->value);
+			changed = 1;
+			continue;
+		}
 
 		if (prop->key != SPA_PROP_params)
 			continue;
