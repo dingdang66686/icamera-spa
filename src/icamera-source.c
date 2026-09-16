@@ -130,6 +130,19 @@ struct frame {
 	struct spa_buffer *outbuf;
 	struct spa_meta_header *h;
 	struct spa_meta_control *control; /* SPA_META_Control (3A) if present */
+
+	/*
+	 * OWNED backing resource (R-B / icamera-allocated buffers).  We save
+	 * the mapping + fd here *in addition to* writing them into the peer's
+	 * spa_buffer->datas[0].  This lets icamera_clear_buffers() unmap/close
+	 * what we allocated even when the peer has already freed the spa_buffer
+	 * they used to travel in (e.g. during a runtime renegotiate when the
+	 * consumer picks a new size/framerate).  Reading them back through the
+	 * stale frame->outbuf->datas[0] in that window is a use-after-free.
+	 */
+	void	    *own_data;	/* mmap'd backing memory (NULL if not owned) */
+	int	     own_fd;	/* backing fd (memfd or prime dmabuf fd), -1 if none */
+	uint32_t     own_size;	/* mapping size for munmap() */
 };
 
 struct port {
@@ -218,6 +231,17 @@ struct impl {
 	struct spa_fraction out_framerate;
 
 	bool active;
+
+	/* Set when use_buffers(nbuf==0) tore a *live* stream down because the
+	 * consumer detached.  PipeWire pulls a live source's buffers back
+	 * without routing Suspend/Start, and it does NOT send a fresh Start to
+	 * the next consumer that re-links the still-"running" node -- only a
+	 * new use_buffers(nbuf>0, ALLOC).  Since the disconnect branch already
+	 * cleared active (and destroyed the backend), that re-link would
+	 * otherwise be mistaken for a lazy first connect and never (re)start
+	 * the stream -> the new consumer hangs.  This flag makes the next
+	 * use_buffers() restart the capture even though active==false. */
+	bool stream_stopped;
 
 	/* one output port */
 	struct port out_port;
@@ -587,22 +611,26 @@ static void *capture_thread_main_direct(void *data)
 
 		struct frame *frame = &impl->out_port.buffers[idx];
 
-#if ENABLE_DMA_BUF
-		/* R-B dma-mode: invalidate the CPU cache for the (mmap'd)
-		 * DMA-BUF so a CPU consumer sees the HAL's fresh DMA write. */
-		if (impl->out_port.dma_buf)
-			icamera_dmabuf_sync_read(frame->outbuf->datas[0].fd);
-#endif
-
 		/* Present the frame.  Set its pts on the monotonic clock for the
-		 * sink, mark it filled/outstanding, and queue it for process(). */
+		 * sink, mark it filled/outstanding, and queue it for process().
+		 *
+		 * All outbuf access + queuing happens under queue_lock so it is
+		 * serialised against use_buffers()/icamera_clear_buffers() during
+		 * a runtime renegotiate; there the peer may free the spa_buffer
+		 * (and we NULL frame->outbuf), so check it under the lock. */
+		pthread_mutex_lock(&impl->out_port.queue_lock);
 		frame->pts = icamera_now_nsec(impl);
 		if (frame->outbuf && frame->outbuf->n_datas > 0 &&
 		    frame->outbuf->datas[0].chunk)
 			frame->outbuf->datas[0].chunk->size =
 				(uint32_t)impl->out_port.data_size;
-
-		pthread_mutex_lock(&impl->out_port.queue_lock);
+#if ENABLE_DMA_BUF
+		/* R-B dma-mode: invalidate the CPU cache for the (mmap'd)
+		 * DMA-BUF so a CPU consumer sees the HAL's fresh DMA write. */
+		if (impl->out_port.dma_buf && frame->outbuf &&
+		    frame->outbuf->n_datas > 0)
+			icamera_dmabuf_sync_read(frame->outbuf->datas[0].fd);
+#endif
 		SPA_FLAG_SET(frame->flags, 1);
 		spa_list_append(&impl->out_port.queue, &frame->link);
 		{
@@ -819,6 +847,9 @@ static int camhal_start(struct impl *impl)
 	}
 
 	impl->active = true;
+	/* A successful (re)start consumes the "stopped by disconnect" state;
+	 * from here on the normal active lifecycle governs. */
+	impl->stream_stopped = false;
 	return 0;
 }
 
@@ -1848,7 +1879,7 @@ static int impl_node_port_set_param(void *object,
 		port->format = fourcc;
 		port->width = impl->res[best].width;
 		port->height = impl->res[best].height;
-		port->data_size = v4l2_format_size(fourcc,
+		port->data_size = v4l2_format_size(port->format,
 						  port->width, port->height);
 		port->have_format = true;
 		return 0;
@@ -1867,23 +1898,33 @@ static int icamera_clear_buffers(struct impl *impl, struct port *port)
 
 	for (i = 0; i < port->n_buffers; i++) {
 		struct frame *frame = &port->buffers[i];
-		struct spa_data *d;
 
-		if (frame->outbuf == NULL)
-			continue;
-		d = &frame->outbuf->datas[0];
+		/*
+		 * Release ONLY what icamera_alloc_buffers() allocated.  The
+		 * backing fd/mapping are saved in frame->own_* precisely so we
+		 * never have to dereference the peer's spa_buffer through
+		 * frame->outbuf here -- during a runtime renegotiate the peer
+		 * may already have freed that spa_buffer (use-after-free, see
+		 * the coredump in icamera_clear_buffers@1907).  We own the
+		 * backing memory (memfd / prime DMA-BUF mmap) independent of
+		 * the peer's per-config spa_buffer object.
+		 */
 		if (SPA_FLAG_IS_SET(frame->flags, BUFFER_FLAG_OWNED)) {
-			if (d->data)
-				munmap(d->data, d->maxsize);
-			if (d->fd >= 0)
-				close(d->fd);
-			d->data = NULL;
-			d->fd = -1;
-			d->maxsize = 0;
-			d->type = SPA_ID_INVALID;
+			if (frame->own_data && frame->own_size > 0)
+				munmap(frame->own_data, frame->own_size);
+			if (frame->own_fd >= 0)
+				close(frame->own_fd);
+			frame->own_data = NULL;
+			frame->own_fd = -1;
+			frame->own_size = 0;
 			SPA_FLAG_CLEAR(frame->flags, BUFFER_FLAG_OWNED);
 		}
+		/* The spa_buffer itself belongs to the peer; only drop our
+		 * reference to it (and to its parsed meta pointers), never
+		 * dereference them here. */
 		frame->outbuf = NULL;
+		frame->h = NULL;
+		frame->control = NULL;
 	}
 	port->n_buffers = 0;
 #if ENABLE_DMA_BUF
@@ -1963,6 +2004,7 @@ static int icamera_alloc_buffers(struct impl *impl, struct port *port,
 		struct spa_data *d;
 		int fd = -1;
 		void *ptr = NULL;
+		uint32_t own_size = (uint32_t)port->data_size;
 
 		if (buffers[i]->n_datas < 1) {
 			spa_log_error(impl->log, "icamera: buffer %u has no datas", i);
@@ -1979,6 +2021,7 @@ static int icamera_alloc_buffers(struct impl *impl, struct port *port,
 			uint32_t bufsize = (uint32_t)port->data_size;
 			if (bufsize & 4095u)
 				bufsize = (bufsize + 4095u) & ~4095u;
+			own_size = bufsize;
 			bo = drm_intel_bo_alloc(port->bufmgr, "icamera-dma",
 						bufsize, 4096);
 			if (bo == NULL) {
@@ -2042,6 +2085,9 @@ static int icamera_alloc_buffers(struct impl *impl, struct port *port,
 
 		frame->id = i;
 		frame->outbuf = buffers[i];
+		frame->own_data = ptr;
+		frame->own_fd = fd;
+		frame->own_size = own_size;
 		frame->flags = 0;
 		frame->h = (struct spa_meta_header *)spa_buffer_find_meta_data(
 				buffers[i], SPA_META_Header, sizeof(*frame->h));
@@ -2066,6 +2112,20 @@ static int icamera_alloc_buffers(struct impl *impl, struct port *port,
 	return 0;
 }
 
+static int icamera_restart_locked(struct impl *impl, int reconfigure)
+{
+	if (reconfigure) {
+		int rc = camhal_start(impl);
+		if (rc < 0) {
+			if (impl->log)
+				spa_log_error(impl->log,
+					"icamera: restart after renegotiate failed");
+			return rc;
+		}
+	}
+	return 0;
+}
+
 static int impl_node_port_use_buffers(void *object,
 				      enum spa_direction direction,
 				      uint32_t port_id, uint32_t flags,
@@ -2075,6 +2135,7 @@ static int impl_node_port_use_buffers(void *object,
 	struct impl *impl = object;
 	struct port *port = GET_OUT_PORT(impl);
 	uint32_t i;
+	int res;
 
 	if (n_buffers > MAX_BUFFERS)
 		return -ENOSPC;
@@ -2082,6 +2143,38 @@ static int impl_node_port_use_buffers(void *object,
 	ICAM_LOG_INFO(impl, "use_buffers dir=%u port=%u flags=0x%x nbuf=%u",
 		      direction, port_id, flags, n_buffers);
 
+	/*
+	 * Renegotiate = OBS/Firefox picking a new resolution/framerate while the
+	 * sensor is already streaming.  PipeWire routes it to a live source as a
+	 * fresh use_buffers(n_buffers>0, impl->active) -- NOT an explicit
+	 * Suspend/Start.  In ALLOC (dma-mode) / external (R-A) the pool is
+	 * swapped for a fresh set of DMA-BUF fds / memfds that the HAL has NOT
+	 * imported: camhal_backend_configure_dmabuf()/configure_external() only
+	 * ran once at camhal_start() time against the OLD fds.  Without a
+	 * rebuild the HAL keeps DMA-writing into the OLD (freed) fds, so the new
+	 * buffers never fill -> ipu6 "poll timeout" / black frames after a
+	 * resolution switch (and before the UAF fix this is also where it
+	 * crashed).  The fix for both is to tear the stream down, rebuild the
+	 * backing pool from the newly negotiated port->width/height, then
+	 * restart so configure_dmabuf() runs against the fresh fds.
+	 *
+	 * camhal_stop() is deferred safely here: it joins the capture thread
+	 * (which itself takes queue_lock), so it MUST run OUTSIDE queue_lock or
+	 * we deadlock.  reconfigure is a plain int (no <stdbool.h>).
+	 *
+	 * impl->stream_stopped matters here: a *previous* use_buffers(nbuf==0)
+	 * already tore the stream down and cleared active.  PipeWire does NOT
+	 * send a new Start to the next consumer that re-links this still-
+	 * "running" node -- it only re-sends use_buffers(nbuf>0).  So treat the
+	 * re-link after a disconnect as a (re)start too, or the new consumer
+	 * would hang with no capture thread.
+	 */
+	int reconfigure = (n_buffers > 0 && (impl->active || impl->stream_stopped));
+	if (reconfigure && impl->active) {
+		ICAM_LOG_INFO(impl, "use_buffers: live renegotiate -> stopping "
+			      "stream to rebuild buffer pool");
+		camhal_stop(impl);
+	}
 	/*
 	 * A consumer (gst/pipewire client) detaching from a source node without
 	 * an explicit Suspend shows up here as use_buffers(nbuf=0) -- pipewire
@@ -2091,11 +2184,16 @@ static int impl_node_port_use_buffers(void *object,
 	 * forever (the next consumer then gets a stale, still-active backend and
 	 * the pipeline hangs).  Treat nbuf==0 as "disconnect": tear the capture
 	 * down and release the camera so the next consumer can reacquire it.
+	 * (reconfigure above is 0 here since n_buffers==0, no restart.)
 	 */
 	if (n_buffers == 0 && impl->active) {
 		ICAM_LOG_INFO(impl, "use_buffers: consumer disconnected -> stop "
 			      "capture & release camera");
 		camhal_stop(impl);
+		/* Remember that we stopped outside the explicit Start/Stop
+		 * lifecycle so the next re-link (use_buffers nbuf>0 with no
+		 * Start) knows it must (re)start the capture. */
+		impl->stream_stopped = true;
 	}
 
 	pthread_mutex_lock(&port->queue_lock);
@@ -2103,9 +2201,11 @@ static int impl_node_port_use_buffers(void *object,
 		icamera_clear_buffers(impl, port);
 
 	if (flags & SPA_NODE_BUFFERS_FLAG_ALLOC) {
-		int res = icamera_alloc_buffers(impl, port, buffers, n_buffers);
+		res = icamera_alloc_buffers(impl, port, buffers, n_buffers);
 		pthread_mutex_unlock(&port->queue_lock);
-		return res;
+		if (res < 0)
+			return res;
+		return icamera_restart_locked(impl, reconfigure);
 	}
 
 	port->n_buffers = n_buffers;
@@ -2137,7 +2237,7 @@ static int impl_node_port_use_buffers(void *object,
 		frame->link.prev = NULL;
 	}
 	pthread_mutex_unlock(&port->queue_lock);
-	return 0;
+	return icamera_restart_locked(impl, reconfigure);
 }
 
 static int impl_node_port_set_io(void *object,
@@ -2550,11 +2650,13 @@ static int impl_init(const struct spa_handle_factory *factory,
 	impl->info.props = &impl->node_info_dict;
 	impl->params_node[0] = SPA_PARAM_INFO(SPA_PARAM_Props, SPA_PARAM_INFO_READWRITE);
 	impl->params_node[1] = SPA_PARAM_INFO(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
-	impl->params_node[2] = SPA_PARAM_INFO(SPA_PARAM_Format, 0);
+	impl->params_node[2] = SPA_PARAM_INFO(SPA_PARAM_PropInfo, SPA_PARAM_INFO_READ);
+	impl->params_node[3] = SPA_PARAM_INFO(SPA_PARAM_Format, 0);
 	impl->info.params = impl->params_node;
 	impl->info.n_params = N_NODE_PARAMS;
 
 	impl->active = false;
+	impl->stream_stopped = false;
 	impl->backend = NULL;
 	impl->tmpbuf = NULL;
 	impl->capture_thread_running = false;
