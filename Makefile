@@ -19,7 +19,11 @@ SPA_INCDIR   := $(shell pkg-config --cflags libpipewire-0.3 2>/dev/null)
 
 CFLAGS  += -O2 -g -fPIC -Wall -Wextra $(SPA_INCDIR) -Isrc
 CXXFLAGS += -O2 -g -fPIC -Wall -Wextra $(SPA_INCDIR) -Isrc
-LDLIBS   += -lcamhal -lpthread
+# libcamhal is NOT linked directly any more: the backend loads it on demand via
+# dlopen()/dlsym() (see src/camhal_loader.h) so the HAL - and the process-wide
+# SysV shared-memory segment it creates on load - only exists while a camera is
+# actually open.  Hence -ldl instead of -lcamhal.
+LDLIBS   += -lpthread -ldl
 
 # R-B dma-mode compile-time switch (default ON).
 #
@@ -55,16 +59,17 @@ $(SO): $(OBJ)
 # (/usr/lib/lua/5.5/camhal.so).  Compiled as C++ because it talks to libcamhal's
 # C++ API directly (like camhal-list.cpp); lua_* symbols keep C linkage via the
 # extern "C" lua.h include.
-build/camhal.so: src/camhal_lua.cpp
+build/camhal.so: src/camhal_lua.cpp src/camhal_loader.h
 	@mkdir -p build
 	$(CXX) -shared -fPIC -O2 -Wall -Wextra -I/usr/include -Isrc \
-		-o $@ $< -lcamhal -llua -Wl,-soname,camhal.so
+		-o $@ $< -llua -ldl -Wl,-soname,camhal.so
 
 # Standalone camera discovery helper used by the WirePlumber monitor to
 # enumerate camera nodes dynamically (see monitors/icamera/enumerate-device.lua).
-build/camhal-list: src/camhal-list.cpp
+# libcamhal is dlopen()ed on demand (see src/camhal_loader.h).
+build/camhal-list: src/camhal-list.cpp src/camhal_loader.h
 	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -o $@ $< -lcamhal
+	$(CXX) $(CXXFLAGS) -o $@ $< -ldl
 
 build/icamera-source.o: src/icamera-source.c src/camhal_backend.h \
 		src/icamera-format.h src/icamera-metadata.h
@@ -80,7 +85,8 @@ build/icamera-metadata.o: src/icamera-metadata.c src/icamera-metadata.h \
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-build/camhal_backend.o: src/camhal_backend.cpp src/camhal_backend.h
+build/camhal_backend.o: src/camhal_backend.cpp src/camhal_backend.h \
+		src/camhal_loader.h src/camhal_busy.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
@@ -88,7 +94,7 @@ build/camhal_backend.o: src/camhal_backend.cpp src/camhal_backend.h
 # a second open/open cycle succeeds, isolated from WirePlumber auto-linking).
 build/test-hal-release: test/test-hal-release.cpp build/camhal_backend.o
 	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -std=c++11 -o $@ test/test-hal-release.cpp build/camhal_backend.o -lcamhal -lpthread
+	$(CXX) $(CXXFLAGS) -std=c++11 -o $@ test/test-hal-release.cpp build/camhal_backend.o -lpthread -ldl
 
 # Standalone R-B "dma-mode" test: allocate real i915 GEM DMA-BUFs, configure
 # the backend with camhal_backend_configure_dmabuf() (V4L2_MEMORY_DMABUF import),
@@ -96,7 +102,7 @@ build/test-hal-release: test/test-hal-release.cpp build/camhal_backend.o
 # our buffers.  Triggers on libdrm_intel for /dev/dri/renderD128 GEM export.
 build/test-hal-dmabuf: test/test-hal-dmabuf.cpp build/camhal_backend.o
 	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -std=c++11 -o $@ test/test-hal-dmabuf.cpp build/camhal_backend.o -lcamhal -lpthread -ldrm_intel -ldrm
+	$(CXX) $(CXXFLAGS) -std=c++11 -o $@ test/test-hal-dmabuf.cpp build/camhal_backend.o -lpthread -ldl -ldrm_intel -ldrm
 
 .PHONY: clean install install-monitor test-hal-release test-hal-dmabuf \
 	test-pw-dmabuf-direct test-pw-dmabuf-consumer

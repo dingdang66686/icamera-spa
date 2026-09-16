@@ -27,7 +27,16 @@ extern "C" {
 
 #include <libcamhal/api/ICamera.h>
 
+#include "camhal_loader.h"
+
 using namespace icamera;
+
+/* Redirect the two discovery entry points to the on-demand loader table so the
+ * HAL is dlopen()ed only while discover() runs and dlclose()d afterwards (its
+ * destructor then removes the process-wide SysV shared-memory segment, which
+ * would otherwise block camera access from a different UID). */
+#define get_number_of_cameras(...) (icamera_loader::fn().get_number_of_cameras(__VA_ARGS__))
+#define get_camera_info(...)       (icamera_loader::fn().get_camera_info(__VA_ARGS__))
 
 static bool name_is_usb(const char *name)
 {
@@ -42,6 +51,13 @@ static bool name_is_usb(const char *name)
 /* camhal.discover() -> { {name=, facing=, camera_id=, description=}, ... } */
 static int camhal_discover(lua_State *L)
 {
+        /* Load libcamhal just for this scan; unload it again on return. */
+        icamera_loader::guard g;
+        if (!g.ok()) {
+                lua_createtable(L, 0, 0);
+                return 1;
+        }
+
 	int total = get_number_of_cameras();
 	lua_createtable(L, 0, 0);
 

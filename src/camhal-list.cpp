@@ -29,7 +29,15 @@
 
 #include <libcamhal/api/ICamera.h>
 
+#include "camhal_loader.h"
+
 using namespace icamera;
+
+/* Resolve the discovery entry points through the on-demand loader so this
+ * helper does not link libcamhal directly (and therefore does not create its
+ * SysV shared-memory segment until - and only while - enumeration runs). */
+#define get_number_of_cameras(...) (icamera_loader::fn().get_number_of_cameras(__VA_ARGS__))
+#define get_camera_info(...)       (icamera_loader::fn().get_camera_info(__VA_ARGS__))
 
 static bool name_is_usb(const char *name)
 {
@@ -43,6 +51,11 @@ static bool name_is_usb(const char *name)
 
 int main(void)
 {
+	/* Load libcamhal only for this enumeration run; it is unloaded at exit. */
+	icamera_loader::guard g;
+	if (!g.ok())
+		return 1;
+
 	int total = get_number_of_cameras();
 	if (total <= 0)
 		return 1;

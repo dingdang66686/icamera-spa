@@ -35,7 +35,47 @@
 #include <libcamhal/api/Parameters.h>
 #include <libcamhal/linux/videodev2.h>
 
+#include "camhal_loader.h"
+#include "camhal_busy.h"
+
 using namespace icamera;
+
+/* ------------------------------------------------------------------ */
+/* On-demand libcamhal loading                                         */
+/*                                                                     */
+/* libcamhal creates a process-wide SysV shared-memory segment (fixed  */
+/* key 0x43414D, mode 0640) from a global constructor as soon as the   */
+/* library is loaded.  Linking it directly would create that segment    */
+/* in ANY process that merely enumerates cameras, which then blocks     */
+/* camera use from a different UID / login session.  Instead we dlopen  */
+/* the HAL only when it is needed and dlclose() it when the last user   */
+/* is gone: the library destructor then removes the segment again.      */
+/*                                                                     */
+/* The HAL entry points are plain C symbols, resolved with dlsym(); the */
+/* capture code below is redirected to the resolved table via these     */
+/* macros so the call sites stay unchanged.                             */
+/* ------------------------------------------------------------------ */
+using icamera_loader::fn;
+#define camera_hal_init(...)                   (fn().camera_hal_init(__VA_ARGS__))
+#define camera_hal_deinit(...)                 (fn().camera_hal_deinit(__VA_ARGS__))
+#define camera_device_open(...)                (fn().camera_device_open(__VA_ARGS__))
+#define camera_device_close(...)               (fn().camera_device_close(__VA_ARGS__))
+#define camera_device_config_sensor_input(...) (fn().camera_device_config_sensor_input(__VA_ARGS__))
+#define camera_device_config_streams(...)      (fn().camera_device_config_streams(__VA_ARGS__))
+#define camera_device_start(...)               (fn().camera_device_start(__VA_ARGS__))
+#define camera_device_stop(...)                (fn().camera_device_stop(__VA_ARGS__))
+#define camera_device_allocate_memory(...)     (fn().camera_device_allocate_memory(__VA_ARGS__))
+#define camera_stream_qbuf(...)                (fn().camera_stream_qbuf(__VA_ARGS__))
+#define camera_stream_dqbuf(...)               (fn().camera_stream_dqbuf(__VA_ARGS__))
+#define camera_set_parameters(...)             (fn().camera_set_parameters(__VA_ARGS__))
+#define get_number_of_cameras(...)             (fn().get_number_of_cameras(__VA_ARGS__))
+#define get_camera_info(...)                   (fn().get_camera_info(__VA_ARGS__))
+#define get_frame_size(...)                    (fn().get_frame_size(__VA_ARGS__))
+
+/* icamera::Parameters is a C++ class; its members are routed through the
+ * dlsym()'d bridge so the plugin carries no libcamhal symbol dependency. */
+#define get_supported_stream_config(par_ptr, vec_ptr) \
+	(icamera_loader::par().get_SupportedStreamConfig((par_ptr), (vec_ptr)))
 
 /* ------------------------------------------------------------------ */
 /* Logging helpers                                                     */
@@ -97,23 +137,43 @@ static size_t camhal_packed_size(uint32_t fourcc, uint32_t w, uint32_t h)
 static pthread_mutex_t g_hal_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_hal_refs = 0;
 
+/*
+ * Ref-counted HAL lifecycle.  On the first reference we dlopen() libcamhal and
+ * dlsym() its entry points; on the last we camera_hal_deinit() and dlclose()
+ * it again, so the camera HAL (and its SysV shared-memory segment) only exists
+ * while a camera is actually open.
+ */
 static int hal_ref(void)
 {
 	pthread_mutex_lock(&g_hal_lock);
-	int ret = camera_hal_init();
-	if (ret == 0)
-		g_hal_refs++;
+	if (g_hal_refs == 0) {
+		if (icamera_loader::acquire() < 0) {
+			pthread_mutex_unlock(&g_hal_lock);
+			return -EIO;
+		}
+		if (camera_hal_init() != 0) {
+			icamera_loader::release();
+			pthread_mutex_unlock(&g_hal_lock);
+			return -EIO;
+		}
+	}
+	g_hal_refs++;
 	pthread_mutex_unlock(&g_hal_lock);
-	return ret;
+	return 0;
 }
 
 static void hal_unref(void)
 {
 	pthread_mutex_lock(&g_hal_lock);
-	if (g_hal_refs > 0)
+	if (g_hal_refs > 0) {
 		g_hal_refs--;
-	if (g_hal_refs == 0)
-		camera_hal_deinit();
+		if (g_hal_refs == 0) {
+			camera_hal_deinit();
+			/* Last user: unload libcamhal; its destructor removes the
+			 * HAL instance and the shared-memory segment. */
+			icamera_loader::release();
+		}
+	}
 	pthread_mutex_unlock(&g_hal_lock);
 }
 
@@ -140,6 +200,13 @@ struct camhal_camera_info *camhal_discover_cameras(int *out_count)
 	if (!out_count)
 		return NULL;
 	*out_count = 0;
+
+	/* Discovery does not require camera_hal_init(); load the HAL only for
+	 * this enumeration and unload it again when the guard goes out of
+	 * scope, so the library's shared-memory segment does not linger. */
+	icamera_loader::guard g;
+	if (!g.ok())
+		return NULL;
 
 	total = get_number_of_cameras();
 	if (total <= 0)
@@ -268,6 +335,10 @@ long camhal_backend_get_frame_size(int camera_id, uint32_t format,
 				   int width, int height)
 {
 	int bpp = 0;
+	/* No backend held: load the HAL just for this query. */
+	icamera_loader::guard g;
+	if (!g.ok())
+		return -EIO;
 	return get_frame_size(camera_id, format, width, height,
 			      V4L2_FIELD_ANY, &bpp);
 }
@@ -280,6 +351,11 @@ int camhal_backend_get_supported_formats(int camera_id,
 	if (!outs || max_count <= 0)
 		return -EINVAL;
 
+	/* No backend held: load the HAL just for this query. */
+	icamera_loader::guard g;
+	if (!g.ok())
+		return -EIO;
+
 	camera_info_t cinfo;
 	memset(&cinfo, 0, sizeof(cinfo));
 	if (get_camera_info(camera_id, cinfo) < 0 || !cinfo.capability)
@@ -287,7 +363,10 @@ int camhal_backend_get_supported_formats(int camera_id,
 
 	stream_array_t configs;
 	configs.clear();
-	cinfo.capability->getSupportedStreamConfig(configs);
+	/* cinfo.capability is an icamera::Parameters; call its member through the
+	 * dlsym()'d bridge (see camhal_loader.h) so the plugin keeps no libcamhal
+	 * symbol dependency. */
+	get_supported_stream_config(cinfo.capability, &configs);
 
 	/* Enumerate every distinct (format, width, height) the HAL advertises,
 	 * for whatever pixel format it reports (not just NV12). */
@@ -335,40 +414,43 @@ int camhal_backend_get_supported_formats(int camera_id,
 static int push_3a(int camera_id, const struct camhal_3a_settings *s,
 		   struct spa_log *log)
 {
-	icamera::Parameters p;
+	/* Built on the stack through the dlsym()'d ctor; routed to the HAL via the
+	 * Parameters member bridge so the plugin stays free of libcamhal symbols. */
+	icamera_loader::parameters p;
+	struct icamera_loader::par &pa = icamera_loader::par();
 	int ret;
 
 	/* AE mode + manual exposure/gain. */
 	if (s->ae_mode != 0) {
 		/* treat any non-zero as MANUAL (0 == AUTO default) */
-		p.setAeMode(icamera::AE_MODE_MANUAL);
+		pa.set_AeMode(p.get(), icamera::AE_MODE_MANUAL);
 		if (s->apply_exposure && s->exposure_time >= 0)
-			p.setExposureTime(s->exposure_time);
+			pa.set_ExposureTime(p.get(), s->exposure_time);
 		if (s->apply_gain && s->gain > 0)
-			p.setSensitivityGain(s->gain);
+			pa.set_SensitivityGain(p.get(), s->gain);
 	} else {
-		p.setAeMode(icamera::AE_MODE_AUTO);
+		pa.set_AeMode(p.get(), icamera::AE_MODE_AUTO);
 	}
 
 	/* AWB mode + manual gains.  With AWB_MODE_MANUAL_GAIN set the HAL uses
 	 * setAwbGains() as the white point; otherwise supply gains are ignored
 	 * by the HAL, so only send them when the user enabled manual gains. */
 	if (s->awb_mode >= 0)
-		p.setAwbMode((camera_awb_mode_t)s->awb_mode);
+		pa.set_AwbMode(p.get(), (camera_awb_mode_t)s->awb_mode);
 	if (s->apply_awb_gains) {
 		icamera::camera_awb_gains_t g;
 		g.r_gain = s->awb_r_gain;
 		g.g_gain = s->awb_g_gain;
 		g.b_gain = s->awb_b_gain;
-		p.setAwbGains(g);
+		pa.set_AwbGains(p.get(), g);
 	}
 
 	if (s->frame_rate > 0)
-		p.setFrameRate(s->frame_rate);
+		pa.set_FrameRate(p.get(), s->frame_rate);
 	if (s->run_3a_cadence > 0)
-		p.setRun3ACadence(s->run_3a_cadence);
+		pa.set_Run3ACadence(p.get(), s->run_3a_cadence);
 
-	ret = camera_set_parameters(camera_id, p);
+	ret = camera_set_parameters(camera_id, p.ref());
 	if (ret != 0) {
 		if (log)
 			spa_log_warn(log, "camhal: camera_set_parameters ret=%d", ret);
@@ -398,6 +480,23 @@ struct camhal_backend *camhal_backend_create(int camera_id,
 	if (!b)
 		return NULL;
 
+	/*
+	 * Cross-session arbitration.  If libcamhal's SysV segment already exists
+	 * and is owned by another UID, a camera is in use from a different login
+	 * session (the HAL's own 0640 segment mode would reject us with EACCES
+	 * anyway).  Fail fast with EBUSY and - crucially - without dlopen()ing
+	 * libcamhal, so we do not create/clash with anything.
+	 */
+	if (camhal_camera_busy()) {
+		if (log)
+			spa_log_warn(log, "camhal: camera %d busy in another "
+				     "session (foreign HAL shm), returning EBUSY",
+				     camera_id);
+		errno = EBUSY;
+		delete b;
+		return NULL;
+	}
+
 	memset(b, 0, sizeof(*b));
 	b->camera_id = camera_id;
 	b->log = log;
@@ -410,7 +509,7 @@ struct camhal_backend *camhal_backend_create(int camera_id,
 		return NULL;
 	}
 
-	if (camera_device_open(camera_id) < 0) {
+	if (camera_device_open(camera_id, 0) < 0) {
 		hal_unref();
 		delete b;
 		return NULL;
@@ -729,7 +828,7 @@ int camhal_backend_configure(struct camhal_backend *b,
 
 	if (get_camera_info(b->camera_id, cinfo) == 0 && cinfo.capability) {
 		configs.clear();
-		cinfo.capability->getSupportedStreamConfig(configs);
+		get_supported_stream_config(cinfo.capability, &configs);
 		for (size_t i = 0; i < configs.size(); i++) {
 			if ((uint32_t)configs[i].format == format &&
 			    configs[i].width == (uint32_t)width &&
@@ -865,34 +964,35 @@ int camhal_backend_start(struct camhal_backend *b)
 static void metadata_capture(struct camhal_backend *b,
 			     const icamera::Parameters &settings)
 {
+	struct icamera_loader::par &pa = icamera_loader::par();
 	struct camhal_metadata m;
 	int ret;
 
 	memset(&m, 0, sizeof(m));
 
 	camera_ae_state_t ae = AE_STATE_NOT_CONVERGED;
-	if (settings.getAeState(ae) == 0)
+	if (pa.get_AeState(&settings, &ae) == 0)
 		m.ae_state = ae;
 
 	int64_t exposure = 0;
-	if (settings.getExposureTime(exposure) == 0)
+	if (pa.get_ExposureTime(&settings, &exposure) == 0)
 		m.exposure_us = exposure;
 
 	int iso = 0;
-	if (settings.getSensitivityIso(iso) == 0)
+	if (pa.get_SensitivityIso(&settings, &iso) == 0)
 		m.iso = iso;
 
 	float fps = 0.0f;
-	if (settings.getFrameRate(fps) == 0)
+	if (pa.get_FrameRate(&settings, &fps) == 0)
 		m.fps = fps;
 
 	camera_awb_state_t awb = AWB_STATE_NOT_CONVERGED;
-	if (settings.getAwbState(awb) == 0)
+	if (pa.get_AwbState(&settings, &awb) == 0)
 		m.awb_state = awb;
 
 	camera_awb_result_t awbRes;
 	memset(&awbRes, 0, sizeof(awbRes));
-	ret = settings.getAwbResult(&awbRes);
+	ret = pa.get_AwbResult(&settings, &awbRes);
 	if (ret == 0) {
 		/* r_per_g / b_per_g are relative to green; report green as 1.0. */
 		m.awb_r_per_g = awbRes.r_per_g;
@@ -902,7 +1002,7 @@ static void metadata_capture(struct camhal_backend *b,
 		/* Fall back to the RGB gains if the dedicated awb_result is absent. */
 		camera_awb_gains_t gains;
 		memset(&gains, 0, sizeof(gains));
-		if (settings.getAwbGains(gains) == 0 && gains.g_gain > 0) {
+		if (pa.get_AwbGains(&settings, &gains) == 0 && gains.g_gain > 0) {
 			m.awb_r_per_g = (float)gains.r_gain / (float)gains.g_gain;
 			m.awb_g_per_g = 1.0f;
 			m.awb_b_per_g = (float)gains.b_gain / (float)gains.g_gain;
@@ -939,15 +1039,16 @@ int camhal_backend_dqbuf(struct camhal_backend *b,
 		return -EINVAL;
 
 	camera_buffer_t *buf = NULL;
-	icamera::Parameters settings;
+	icamera_loader::parameters settings;
 
 	/* Block until a frame is ready.  The dqbuf `settings` output carries the
 	 * per-frame 3A results actually applied to this frame (AE exposure / ISO /
 	 * frame rate / AWB), which we forward to the plugin as metadata. */
-	if (camera_stream_dqbuf(b->camera_id, b->stream_id, &buf, &settings) < 0)
+	if (camera_stream_dqbuf(b->camera_id, b->stream_id, &buf,
+				(icamera::Parameters *)settings.get()) < 0)
 		return -EIO;
 
-	metadata_capture(b, settings);
+	metadata_capture(b, settings.ref());
 
 		if (buf && dst && buf->addr) {
 			int copy = size;
@@ -1063,7 +1164,7 @@ int camhal_backend_configure_external(struct camhal_backend *b,
 
 	if (get_camera_info(b->camera_id, cinfo) == 0 && cinfo.capability) {
 		configs.clear();
-		cinfo.capability->getSupportedStreamConfig(configs);
+		get_supported_stream_config(cinfo.capability, &configs);
 		for (size_t i = 0; i < configs.size(); i++) {
 			if ((uint32_t)configs[i].format == format &&
 			    configs[i].width == (uint32_t)width &&
@@ -1167,7 +1268,7 @@ int camhal_backend_configure_dmabuf(struct camhal_backend *b,
 
 	if (get_camera_info(b->camera_id, cinfo) == 0 && cinfo.capability) {
 		configs.clear();
-		cinfo.capability->getSupportedStreamConfig(configs);
+		get_supported_stream_config(cinfo.capability, &configs);
 		for (size_t i = 0; i < configs.size(); i++) {
 			if ((uint32_t)configs[i].format == format &&
 			    configs[i].width == (uint32_t)width &&
@@ -1256,14 +1357,15 @@ int camhal_backend_dqbuf_index(struct camhal_backend *b,
 	if (!b || !b->running || !b->external || !out_index)
 		return -EINVAL;
 
-	icamera::Parameters settings;
+	icamera_loader::parameters settings;
 
 	/* Block until a frame lands in one of the direct-mode USERPTR buffers.
 	 * Capture the per-frame 3A results via the dqbuf `settings` output. */
-	if (camera_stream_dqbuf(b->camera_id, b->stream_id, &buf, &settings) < 0)
+	if (camera_stream_dqbuf(b->camera_id, b->stream_id, &buf,
+				(icamera::Parameters *)settings.get()) < 0)
 		return -EIO;
 
-	metadata_capture(b, settings);
+	metadata_capture(b, settings.ref());
 
 	if (buf->index < 0 || buf->index >= b->n_buffers) {
 		CAM_LOG_ERR(b, "camhal: dqbuf_index returned bad index %d (n=%d)",
