@@ -97,4 +97,4 @@ No functional changes are recorded for this release; it exists as the
 starting point that 0.0.2 is measured against.
 
 [0.0.2]: https://github.com/dingdang66686/icamera-spa/compare/v0.0.1...v0.0.2
-[0.0.1]: https://github.com/dingdang66686/icamera-spa/releases/tag/v0.0.1
+[0.0.1]: https://github.com/dingdang66686/icamera-spa/commits/v0.0.1
