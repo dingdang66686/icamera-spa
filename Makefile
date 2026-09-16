@@ -16,6 +16,16 @@ PREFIX   ?= /usr
 LIBDIR   ?= $(PREFIX)/lib
 
 SPA_INCDIR   := $(shell pkg-config --cflags libpipewire-0.3 2>/dev/null)
+# Pull in the PipeWire/SPA headers as *system* headers (-isystem instead of
+# -I).  -Wextra otherwise reports two warnings that originate inside them and
+# that we cannot fix:
+#   spa/param/param.h:66     missing initializer for 'user' in spa_param_info
+#   spa/pod/compare.h:190    unused parameter 'size'
+# Our own sources keep the full -Wall -Wextra treatment.
+SPA_INCDIR   := $(patsubst -I%,-isystem %,$(SPA_INCDIR))
+# libpipewire itself is only needed by the pw_stream-based tests
+# (test-pw-dmabuf-consumer); the SPA tests dlopen the plugin instead.
+PW_LIBS      := $(shell pkg-config --libs libpipewire-0.3 2>/dev/null)
 
 CFLAGS  += -O2 -g -fPIC -Wall -Wextra $(SPA_INCDIR) -Isrc
 CXXFLAGS += -O2 -g -fPIC -Wall -Wextra $(SPA_INCDIR) -Isrc
@@ -119,7 +129,7 @@ build/test-pw-dmabuf-direct: test/test-pw-dmabuf-direct.c
 # pw_stream-based DmaBuf consumer (negotiates MemFd only; kept for reference).
 build/test-pw-dmabuf-consumer: test/test-pw-dmabuf-consumer.c
 	@mkdir -p build
-	$(CC) -O2 -g -Wall -Wextra -o $@ $< $(SPA_INCDIR)
+	$(CC) -O2 -g -Wall -Wextra -o $@ $< $(SPA_INCDIR) $(PW_LIBS)
 
 test-pw-dmabuf-direct: build/test-pw-dmabuf-direct
 test-pw-dmabuf-consumer: build/test-pw-dmabuf-consumer

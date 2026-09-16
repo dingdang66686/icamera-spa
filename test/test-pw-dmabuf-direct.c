@@ -40,6 +40,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <stdint.h>
+#include <inttypes.h>
 
 /* support/logger for the node */
 #include <spa/support/log.h>
@@ -214,12 +215,12 @@ static int negotiate_format(struct spa_node *node, struct spa_io_buffers *io)
 	return 0;
 }
 
-static void dump_buffer_state(struct spa_node *node)
+static void dump_buffer_state(void)
 {
 	int i;
 	for (i = 0; i < MAX_BUFFERS; i++) {
 		struct spa_data *d = &buffers[i].datas[0];
-		fprintf(stderr, "  buf[%d] type=%u fd=%d data=%p max=%u\n",
+		fprintf(stderr, "  buf[%d] type=%u fd=%" PRIi64 " data=%p max=%u\n",
 			i, d->type, d->fd, (void *)d->data, d->maxsize);
 	}
 	int dmabuf = 1;
@@ -246,7 +247,7 @@ int main(int argc, char **argv)
 	if ((res = negotiate_format(node, &io)) < 0)
 		return res;
 
-	dump_buffer_state(node);
+	dump_buffer_state();
 
 	/* sanity: if any buffer is not a DmaBuf, our allocator didn't run */
 	for (i = 0; i < MAX_BUFFERS; i++)
@@ -300,7 +301,7 @@ int main(int argc, char **argv)
 			}
 
 			if ((frames % 10) == 0)
-				fprintf(stderr, "  frame %d id=%u fd=%d\n",
+				fprintf(stderr, "  frame %d id=%u fd=%" PRIi64 "\n",
 					frames, id, buffers[id].datas[0].fd);
 
 			/* Mark consumed: next process() call recycles this buffer

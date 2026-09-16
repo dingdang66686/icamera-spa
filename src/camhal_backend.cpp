@@ -831,8 +831,8 @@ int camhal_backend_configure(struct camhal_backend *b,
 		get_supported_stream_config(cinfo.capability, &configs);
 		for (size_t i = 0; i < configs.size(); i++) {
 			if ((uint32_t)configs[i].format == format &&
-			    configs[i].width == (uint32_t)width &&
-			    configs[i].height == (uint32_t)height) {
+			    configs[i].width == width &&
+			    configs[i].height == height) {
 				stream = configs[i];
 				found = 1;
 				break;
@@ -1167,8 +1167,8 @@ int camhal_backend_configure_external(struct camhal_backend *b,
 		get_supported_stream_config(cinfo.capability, &configs);
 		for (size_t i = 0; i < configs.size(); i++) {
 			if ((uint32_t)configs[i].format == format &&
-			    configs[i].width == (uint32_t)width &&
-			    configs[i].height == (uint32_t)height) {
+			    configs[i].width == width &&
+			    configs[i].height == height) {
 				stream = configs[i];
 				found = 1;
 				break;
@@ -1271,8 +1271,8 @@ int camhal_backend_configure_dmabuf(struct camhal_backend *b,
 		get_supported_stream_config(cinfo.capability, &configs);
 		for (size_t i = 0; i < configs.size(); i++) {
 			if ((uint32_t)configs[i].format == format &&
-			    configs[i].width == (uint32_t)width &&
-			    configs[i].height == (uint32_t)height) {
+			    configs[i].width == width &&
+			    configs[i].height == height) {
 				stream = configs[i];
 				found = 1;
 				break;

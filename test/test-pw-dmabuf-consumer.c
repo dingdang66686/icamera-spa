@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdint.h>
+#include <inttypes.h>
 
 #include <pipewire/pipewire.h>
 #include <pipewire/stream.h>
@@ -60,6 +61,7 @@ static void on_process(void *userdata)
 	struct pw_stream *stream = ctx.stream;
 	struct pw_buffer *b;
 
+	(void)userdata;
 	if ((b = pw_stream_dequeue_buffer(stream)) == NULL) {
 		pw_log_warn("no buffer to dequeue");
 		return;
@@ -69,7 +71,7 @@ static void on_process(void *userdata)
 	if (sb->n_datas > 0) {
 		uint32_t t = sb->datas[0].type;
 		if (!ctx.dmabuf_ok) {
-			pw_log_info("consumer got buffer type=%u fd=%d max=%u",
+			pw_log_info("consumer got buffer type=%u fd=%" PRIi64 " max=%u",
 				    t, sb->datas[0].fd, sb->datas[0].maxsize);
 			ctx.dmabuf_ok = (t == SPA_DATA_DmaBuf);
 		}
@@ -82,18 +84,6 @@ static void on_process(void *userdata)
 		pw_main_loop_quit(ctx.loop);
 	}
 }
-
-static void on_param_changed(void *userdata, uint32_t id,
-			     const struct spa_pod *param)
-{
-	/* not needed */
-}
-
-static const struct pw_stream_events stream_events = {
-	PW_VERSION_STREAM_EVENTS,
-	.process = on_process,
-	.param_changed = on_param_changed,
-};
 
 /* Build the SPA format we request: NV12 640x480. */
 static uint8_t format_buffer[4096];
@@ -124,6 +114,8 @@ static const struct spa_pod *build_format(void)
 static void on_state_changed(void *userdata, enum pw_stream_state old,
 			     enum pw_stream_state state, const char *error)
 {
+	(void)userdata;
+	(void)old;
 	pw_log_info("stream state: %s (%s)", pw_stream_state_as_string(state),
 		    error ? error : "");
 	if (state == PW_STREAM_STATE_ERROR) {
