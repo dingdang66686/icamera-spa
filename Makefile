@@ -105,7 +105,7 @@ build/test-hal-dmabuf: test/test-hal-dmabuf.cpp build/camhal_backend.o
 	$(CXX) $(CXXFLAGS) -std=c++11 -o $@ test/test-hal-dmabuf.cpp build/camhal_backend.o -lpthread -ldl -ldrm_intel -ldrm
 
 .PHONY: clean install install-monitor test-hal-release test-hal-dmabuf \
-	test-pw-dmabuf-direct test-pw-dmabuf-consumer
+	test-pw-dmabuf-direct test-pw-dmabuf-consumer test-pw-reneg
 test-hal-release: build/test-hal-release
 test-hal-dmabuf: build/test-hal-dmabuf
 
@@ -123,6 +123,16 @@ build/test-pw-dmabuf-consumer: test/test-pw-dmabuf-consumer.c
 
 test-pw-dmabuf-direct: build/test-pw-dmabuf-direct
 test-pw-dmabuf-consumer: build/test-pw-dmabuf-consumer
+
+# Renegotiate regression test: dlopens the installed libspa-icamera.so and
+# drives the live node through several resolution changes (R-B dma-mode),
+# validating the icamera_clear_buffers() use-after-free / buffer-pool rebuild
+# fix.  Exit 0 only if every step survives and frames keep flowing.
+build/test-pw-reneg: test/test-pw-reneg.c
+	@mkdir -p build
+	$(CC) -O2 -g -Wall -Wextra -o $@ $< $(SPA_INCDIR)
+
+test-pw-reneg: build/test-pw-reneg
 clean:
 	rm -rf build
 
